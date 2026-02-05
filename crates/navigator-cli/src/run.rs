@@ -18,11 +18,12 @@ use navigator_core::proto::{
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 // Re-export SSH functions for backward compatibility
-pub use crate::ssh::{sandbox_connect, sandbox_ssh_proxy};
+pub use crate::ssh::{sandbox_connect, sandbox_exec, sandbox_rsync, sandbox_ssh_proxy};
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {
@@ -250,7 +251,12 @@ pub async fn cluster_admin_destroy(name: &str) -> Result<()> {
 }
 
 /// Create a sandbox with default settings.
-pub async fn sandbox_create(server: &str) -> Result<()> {
+pub async fn sandbox_create(
+    server: &str,
+    sync: bool,
+    keep: bool,
+    command: &[String],
+) -> Result<()> {
     let mut client = NavigatorClient::connect(server.to_string())
         .await
         .into_diagnostic()?;
@@ -390,7 +396,32 @@ pub async fn sandbox_create(server: &str) -> Result<()> {
         Ok(SandboxPhase::Ready) => {
             drop(stream);
             drop(client);
-            sandbox_connect(server, &sandbox_id).await
+
+            if sync {
+                let repo_root = git_repo_root()?;
+                let files = git_sync_files(&repo_root)?;
+                if !files.is_empty() {
+                    sandbox_rsync(server, &sandbox_id, &repo_root, &files).await?;
+                }
+            }
+
+            if command.is_empty() {
+                return sandbox_connect(server, &sandbox_id).await;
+            }
+
+            let exec_result = sandbox_exec(server, &sandbox_id, command, interactive).await;
+
+            if !interactive
+                && !keep
+                && let Err(err) = sandbox_delete(server, std::slice::from_ref(&sandbox_id)).await
+            {
+                if exec_result.is_ok() {
+                    return Err(err);
+                }
+                eprintln!("Failed to delete sandbox {sandbox_id}: {err}");
+            }
+
+            exec_result
         }
         Ok(SandboxPhase::Error) => {
             if last_error_reason.is_empty() {
@@ -806,4 +837,55 @@ pub async fn sandbox_delete(server: &str, ids: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn git_repo_root() -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        return Err(miette::miette!(
+            "git rev-parse --show-toplevel failed with status {}",
+            output.status
+        ));
+    }
+
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err(miette::miette!(
+            "git rev-parse returned empty repository root"
+        ));
+    }
+
+    Ok(PathBuf::from(root))
+}
+
+fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .current_dir(repo_root)
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to run git ls-files")?;
+
+    if !output.status.success() {
+        return Err(miette::miette!(
+            "git ls-files failed with status {}",
+            output.status
+        ));
+    }
+
+    let mut files = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(entry).to_string();
+        files.push(path);
+    }
+
+    Ok(files)
 }

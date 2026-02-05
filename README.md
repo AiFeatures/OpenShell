@@ -13,7 +13,7 @@ It transforms the data center from a static deployment target into a continuous 
 ```bash
 uv pip install [todo, publish package]
 
-navigator sandbox claude  # or opencode
+navigator sandbox create -- claude  # or opencode or codex
 ```
 
 ## Developing

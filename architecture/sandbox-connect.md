@@ -25,6 +25,17 @@ authenticates it, then bridges raw TCP to an embedded SSH server inside the sand
 - **Sandbox pod routing**: `crates/navigator-server/src/sandbox/mod.rs`
   - Resolves pod IPs from Kubernetes and injects SSH env vars into the pod template.
 
+## Sync Flow (CLI `sandbox create --sync`)
+
+When `--sync` is set on `nav sandbox create`, the CLI rsyncs local files into the sandbox after
+it reaches `Ready` and before any command runs. This is opt-in only and respects gitignore rules.
+
+- **Source selection**: `git ls-files -co --exclude-standard` from the repo root.
+- **Transport**: `rsync -az --from0 --files-from=- --relative -e "ssh ..."` over the existing
+  SSH proxy tunnel.
+- **Destination**: files are copied into `/sandbox` inside the sandbox container.
+- **Ordering**: sync runs before `exec` so the command sees the latest files.
+
 ## API and Persistence
 
 - **CreateSshSession** returns:

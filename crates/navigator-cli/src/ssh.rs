@@ -4,17 +4,22 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{CreateSshSessionRequest, navigator_client::NavigatorClient};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use webpki_roots::TLS_SERVER_ROOTS;
 
-/// Connect to a sandbox via SSH.
-pub async fn sandbox_connect(server: &str, id: &str) -> Result<()> {
+struct SshSessionConfig {
+    proxy_command: String,
+}
+
+async fn ssh_session_config(server: &str, id: &str) -> Result<SshSessionConfig> {
     let mut client = NavigatorClient::connect(server.to_string())
         .await
         .into_diagnostic()?;
@@ -40,9 +45,12 @@ pub async fn sandbox_connect(server: &str, id: &str) -> Result<()> {
         gateway_url, session.sandbox_id, session.token,
     );
 
-    let mut command = std::process::Command::new("ssh");
+    Ok(SshSessionConfig { proxy_command })
+}
+
+fn ssh_base_command(proxy_command: &str) -> Command {
+    let mut command = Command::new("ssh");
     command
-        .arg("-tt")
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
         .arg("-o")
@@ -50,7 +58,17 @@ pub async fn sandbox_connect(server: &str, id: &str) -> Result<()> {
         .arg("-o")
         .arg("UserKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("GlobalKnownHostsFile=/dev/null");
+    command
+}
+
+/// Connect to a sandbox via SSH.
+pub async fn sandbox_connect(server: &str, id: &str) -> Result<()> {
+    let session = ssh_session_config(server, id).await?;
+
+    let mut command = ssh_base_command(&session.proxy_command);
+    command
+        .arg("-tt")
         .arg("-o")
         .arg("RequestTTY=force")
         .arg("-o")
@@ -75,6 +93,103 @@ pub async fn sandbox_connect(server: &str, id: &str) -> Result<()> {
 
     if !status.success() {
         return Err(miette::miette!("ssh exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+/// Execute a command in a sandbox via SSH.
+pub async fn sandbox_exec(server: &str, id: &str, command: &[String], tty: bool) -> Result<()> {
+    if command.is_empty() {
+        return Err(miette::miette!("no command provided"));
+    }
+
+    let session = ssh_session_config(server, id).await?;
+    let mut ssh = ssh_base_command(&session.proxy_command);
+
+    if tty {
+        ssh.arg("-tt")
+            .arg("-o")
+            .arg("RequestTTY=force")
+            .arg("-o")
+            .arg("SetEnv=TERM=xterm-256color");
+    } else {
+        ssh.arg("-T").arg("-o").arg("RequestTTY=no");
+    }
+
+    let command_str = command
+        .iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    ssh.arg("sandbox")
+        .arg(command_str)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    let status = tokio::task::spawn_blocking(move || ssh.status())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!("ssh exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+/// Sync local files into the sandbox using rsync over SSH.
+pub async fn sandbox_rsync(
+    server: &str,
+    id: &str,
+    repo_root: &Path,
+    files: &[String],
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    let session = ssh_session_config(server, id).await?;
+
+    let ssh_command = format!(
+        "ssh -o {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null",
+        shell_escape(&format!("ProxyCommand={}", session.proxy_command))
+    );
+
+    let mut rsync = Command::new("rsync");
+    rsync
+        .arg("-az")
+        .arg("--from0")
+        .arg("--files-from=-")
+        .arg("--relative")
+        .arg("-e")
+        .arg(ssh_command)
+        .arg(".")
+        .arg("sandbox:/sandbox")
+        .current_dir(repo_root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = rsync.spawn().into_diagnostic()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        for path in files {
+            let entry = format!("./{path}");
+            stdin.write_all(entry.as_bytes()).into_diagnostic()?;
+            stdin.write_all(&[0]).into_diagnostic()?;
+        }
+    }
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!("rsync exited with status {status}"));
     }
 
     Ok(())

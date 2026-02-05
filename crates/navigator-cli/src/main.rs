@@ -45,7 +45,7 @@ enum Commands {
 
     /// SSH proxy (used by `ProxyCommand`).
     SshProxy {
-        /// Gateway URL (e.g., https://gw.example.com:443/proxy/connect).
+        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         #[arg(long)]
         gateway: String,
 
@@ -106,7 +106,19 @@ enum ClusterAdminCommands {
 #[derive(Subcommand, Debug)]
 enum SandboxCommands {
     /// Create a sandbox.
-    Create,
+    Create {
+        /// Sync local files into the sandbox before running.
+        #[arg(long)]
+        sync: bool,
+
+        /// Keep the sandbox alive after non-interactive commands.
+        #[arg(long)]
+        keep: bool,
+
+        /// Command to run after "--" (defaults to an interactive shell).
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
 
     /// Fetch a sandbox by id.
     Get {
@@ -184,8 +196,12 @@ async fn main() -> Result<()> {
             },
         },
         Some(Commands::Sandbox { command }) => match command {
-            SandboxCommands::Create => {
-                run::sandbox_create(&cli.cluster).await?;
+            SandboxCommands::Create {
+                sync,
+                keep,
+                command,
+            } => {
+                run::sandbox_create(&cli.cluster, sync, keep, &command).await?;
             }
             SandboxCommands::Get { id } => {
                 run::sandbox_get(&cli.cluster, &id).await?;
