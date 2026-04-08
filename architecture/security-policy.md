@@ -320,7 +320,7 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 | `read_only`       | `string[]` | `[]`    | Paths accessible in read-only mode                             |
 | `read_write`      | `string[]` | `[]`    | Paths accessible in read-write mode                            |
 
-**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V1)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V1)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
+**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V2)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V2)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
 **Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
 
@@ -358,10 +358,16 @@ Controls Landlock LSM compatibility behavior. **Static field** -- immutable afte
 
 | Value              | Behavior                                                                                                                    |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
-| `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error                                                             |
+| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing. Individual inaccessible paths (missing, permission denied, symlink loops) are skipped with a warning while remaining rules are still applied. If all paths fail, the sandbox continues without Landlock rather than applying an empty ruleset that would block all access. |
+| `hard_requirement` | If Landlock is unavailable or any configured path cannot be opened, abort sandbox startup with an error.                    |
 
-See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
+**Per-path error handling**: `PathFd::new()` (which wraps `open(path, O_PATH | O_CLOEXEC)`) can fail for several reasons beyond path non-existence: `EACCES` (permission denied), `ELOOP` (symlink loop), `ENAMETOOLONG`, `ENOTDIR`. Each failure is classified with a human-readable reason in logs. In `best_effort` mode, the path is skipped and ruleset construction continues. In `hard_requirement` mode, the error is fatal.
+
+**Baseline path filtering**: The enrichment functions (`enrich_proto_baseline_paths`, `enrich_sandbox_baseline_paths`) pre-filter system-injected baseline paths (e.g., `/app`) by checking `Path::exists()` before adding them to the policy. This prevents missing baseline paths from reaching Landlock at all. User-specified paths are not pre-filtered — they are evaluated at Landlock apply time so that misconfigurations surface as warnings (`best_effort`) or errors (`hard_requirement`).
+
+**Zero-rule safety check**: If all paths in the ruleset fail to open, `apply()` returns an error rather than calling `restrict_self()` on an empty ruleset. An empty Landlock ruleset with `restrict_self()` would block all filesystem access — the inverse of the intended degradation behavior. This error is caught by the outer `BestEffort` handler, which logs a warning and continues without Landlock.
+
+See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`, `try_open_path()`, `classify_path_fd_error()`, `classify_io_error()`.
 
 ```yaml
 landlock:
@@ -461,9 +467,14 @@ rules:
   - allow:
       method: GET
       path: "/repos/**"
+      query:
+        per_page: "1*"
   - allow:
       method: POST
       path: "/repos/*/issues"
+      query:
+        labels:
+          any: ["bug*", "p1*"]
 ```
 
 #### `L7Allow`
@@ -473,8 +484,9 @@ rules:
 | `method`  | `string` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, or `*` (any). Case-insensitive matching.            |
 | `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
+| `query`   | `map`    | Optional REST query rules keyed by decoded query param name. Value is either a glob string (for example, `tag: "foo-*"`) or `{ any: ["foo-*", "bar-*"] }`. |
 
-Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
+Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. Query matching is case-sensitive and evaluates decoded values; when duplicate keys are present in the request, every value for that key must match the configured matcher. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`, `query_params_match()`.
 
 #### Access Presets
 
@@ -716,7 +728,7 @@ If any condition fails, the proxy returns `403 Forbidden`.
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
 8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. When an endpoint has L7 rules configured, the forward proxy evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
@@ -838,6 +850,10 @@ The response includes an `X-OpenShell-Policy` header and `Connection: close`. Se
 
 ## Seccomp Filter Details
 
+The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `EPERM`. It provides three layers of protection: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+
+### Blocked socket domains
+
 Regardless of network mode, certain socket domains are always blocked:
 
 | Domain         | Constant | Reason                                                                          |
@@ -849,7 +865,30 @@ Regardless of network mode, certain socket domains are always blocked:
 
 In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
-The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+### Blocked syscalls
+
+These syscalls are blocked unconditionally (EPERM for any invocation):
+
+| Syscall | NR (x86-64) | Reason |
+|---------|-------------|--------|
+| `memfd_create` | 319 | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | 101 | Cross-process memory inspection and code injection |
+| `bpf` | 321 | Kernel BPF program loading |
+| `process_vm_readv` | 310 | Cross-process memory read |
+| `io_uring_setup` | 425 | Async I/O subsystem with extensive CVE history |
+| `mount` | 165 | Filesystem mount could subvert Landlock or overlay writable paths |
+
+### Conditionally blocked syscalls
+
+These syscalls are blocked only when specific flag patterns are present in their arguments:
+
+| Syscall | NR (x86-64) | Condition | Reason |
+|---------|-------------|-----------|--------|
+| `execveat` | 322 | `AT_EMPTY_PATH` (0x1000) set in flags (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | 272 | `CLONE_NEWUSER` (0x10000000) set in flags (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | 317 | operation == `SECCOMP_SET_MODE_FILTER` (1) in arg0 | Prevents sandboxed code from replacing the active filter |
+
+Flag checks use `MaskedEq` (`(arg & mask) == mask`) to detect the flag bit regardless of other bits. The `seccomp` syscall check uses `Eq` for exact value comparison on the operation argument.
 
 ---
 
