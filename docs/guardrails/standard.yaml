@@ -1,0 +1,20 @@
+name: standard
+description: Balanced pack. Reads and common operations allowed, destructive or high-risk commands denied or queued for approval.
+allow:
+  - read
+  - list
+  - stat
+  - write
+  - create
+deny:
+  - delete
+  - chmod
+  - chown
+  - kernel_module
+approval_required:
+  - network_egress
+  - package_install
+audit:
+  log_stdout: true
+  log_stderr: true
+  log_approvals: true

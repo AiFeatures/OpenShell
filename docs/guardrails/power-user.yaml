@@ -1,0 +1,21 @@
+name: power-user
+description: Broad pack. Most commands allowed; only irreversible or system-level changes require approval.
+allow:
+  - read
+  - list
+  - stat
+  - write
+  - create
+  - delete
+  - chmod
+  - network_egress
+  - package_install
+deny:
+  - kernel_module
+approval_required:
+  - rm_rf_root
+  - drop_database
+audit:
+  log_stdout: true
+  log_stderr: true
+  log_approvals: true

@@ -1,0 +1,20 @@
+name: observer
+description: Least-privilege pack. Dry-run all commands, block everything with side effects, queue writes for explicit approval.
+allow:
+  - read
+  - list
+  - stat
+deny:
+  - delete
+  - chmod
+  - chown
+  - network_egress
+  - package_install
+  - kernel_module
+approval_required:
+  - write
+  - create
+audit:
+  log_stdout: true
+  log_stderr: true
+  log_approvals: true
