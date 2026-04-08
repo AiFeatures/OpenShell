@@ -597,6 +597,7 @@ enum CliProviderType {
     Claude,
     Opencode,
     Codex,
+    Copilot,
     Generic,
     Openai,
     Anthropic,
@@ -627,6 +628,7 @@ impl CliProviderType {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
             Self::Generic => "generic",
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
@@ -807,6 +809,10 @@ enum GatewayCommands {
         /// NVIDIA k8s-device-plugin so Kubernetes workloads can request
         /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
         /// NVIDIA Container Toolkit on the host.
+        ///
+        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
+        /// CDI enabled and falls back to Docker's NVIDIA GPU request path
+        /// (`--gpus all`) otherwise.
         #[arg(long)]
         gpu: bool,
     },
@@ -937,6 +943,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s).
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
     },
 
     /// Update gateway-level inference configuration (partial update).
@@ -957,6 +967,10 @@ enum InferenceCommands {
         /// Skip endpoint verification before saving the route.
         #[arg(long)]
         no_verify: bool,
+
+        /// Request timeout in seconds for inference calls (0 = default 60s, unchanged if omitted).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Get gateway-level inference provider and model.
@@ -1077,8 +1091,8 @@ enum SandboxCommands {
         /// Upload local files into the sandbox before running.
         ///
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
-        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container
-        /// working directory (`/sandbox`).
+        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
+        /// working directory.
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
         #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
@@ -1104,8 +1118,10 @@ enum SandboxCommands {
         /// Request GPU resources for the sandbox.
         ///
         /// When no gateway is running, auto-bootstrap starts a GPU-enabled
-        /// gateway. GPU intent is also inferred automatically for known
-        /// GPU-designated image names such as `nvidia-gpu`.
+        /// gateway using the same automatic injection selection as
+        /// `openshell gateway start --gpu`. GPU intent is also inferred
+        /// automatically for known GPU-designated image names such as
+        /// `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
 
@@ -1213,6 +1229,48 @@ enum SandboxCommands {
         all: bool,
     },
 
+    /// Execute a command in a running sandbox.
+    ///
+    /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
+    /// Output is streamed to the terminal in real-time. The CLI exits with the
+    /// remote command's exit code.
+    ///
+    /// For interactive shell sessions, use `sandbox connect` instead.
+    ///
+    /// Examples:
+    ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
+    ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
+    ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Exec {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(long, short = 'n', add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Working directory inside the sandbox.
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Timeout in seconds (0 = no timeout).
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
@@ -1239,7 +1297,7 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to `/sandbox`).
+        /// Destination path in the sandbox (defaults to the container's working directory).
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
@@ -1562,6 +1620,11 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
+                let gpu = if gpu {
+                    vec!["auto".to_string()]
+                } else {
+                    vec![]
+                };
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
@@ -2026,10 +2089,11 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, &tls,
+                        endpoint, &provider, &model, route_name, no_verify, timeout, &tls,
                     )
                     .await?;
                 }
@@ -2038,6 +2102,7 @@ async fn main() -> Result<()> {
                     model,
                     system,
                     no_verify,
+                    timeout,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
@@ -2046,6 +2111,7 @@ async fn main() -> Result<()> {
                         model.as_deref(),
                         route_name,
                         no_verify,
+                        timeout,
                         &tls,
                     )
                     .await?;
@@ -2200,7 +2266,7 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
-                    let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
+                    let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
                     if !local.exists() {
                         return Err(miette::miette!(
@@ -2208,7 +2274,8 @@ async fn main() -> Result<()> {
                             local.display()
                         ));
                     }
-                    eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
+                    let dest_display = sandbox_dest.unwrap_or("~");
+                    eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
                     if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
@@ -2281,6 +2348,38 @@ async fn main() -> Result<()> {
                                 run::sandbox_connect(endpoint, &name, &tls).await?;
                             }
                             let _ = save_last_sandbox(&ctx.name, &name);
+                        }
+                        SandboxCommands::Exec {
+                            name,
+                            workdir,
+                            timeout,
+                            tty,
+                            no_tty,
+                            command,
+                        } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            // Resolve --tty / --no-tty into an Option<bool> override.
+                            let tty_override = if no_tty {
+                                Some(false)
+                            } else if tty {
+                                Some(true)
+                            } else {
+                                None // auto-detect
+                            };
+                            let exit_code = run::sandbox_exec_grpc(
+                                endpoint,
+                                &name,
+                                &command,
+                                workdir.as_deref(),
+                                timeout,
+                                tty_override,
+                                &tls,
+                            )
+                            .await?;
+                            let _ = save_last_sandbox(&ctx.name, &name);
+                            if exit_code != 0 {
+                                std::process::exit(exit_code);
+                            }
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -3114,5 +3213,30 @@ mod tests {
             }
             other => panic!("expected settings delete command, got: {other:?}"),
         }
+    }
+
+    /// Ensure every provider registered in `ProviderRegistry` has a
+    /// corresponding `CliProviderType` variant (and vice-versa).
+    /// This test would have caught the missing `Copilot` variant from #707.
+    #[test]
+    fn cli_provider_types_match_registry() {
+        let registry = openshell_providers::ProviderRegistry::new();
+        let registry_types: std::collections::BTreeSet<&str> =
+            registry.known_types().into_iter().collect();
+
+        let cli_types: std::collections::BTreeSet<&str> =
+            <CliProviderType as ValueEnum>::value_variants()
+                .iter()
+                .map(CliProviderType::as_str)
+                .collect();
+
+        assert_eq!(
+            cli_types,
+            registry_types,
+            "CliProviderType variants must match ProviderRegistry.known_types(). \
+             CLI-only: {:?}, Registry-only: {:?}",
+            cli_types.difference(&registry_types).collect::<Vec<_>>(),
+            registry_types.difference(&cli_types).collect::<Vec<_>>(),
+        );
     }
 }

@@ -164,6 +164,16 @@ Keep inference traffic private by routing API calls to local or self-hosted back
 {bdg-secondary}`Concept`
 :::
 
+:::{grid-item-card} Observability
+:link: observability/index
+:link-type: doc
+
+Understand sandbox logs, access them via CLI and TUI, and export OCSF JSON records.
+
++++
+{bdg-secondary}`How-To`
+:::
+
 :::{grid-item-card} Reference
 :link: reference/default-policy
 :link-type: doc
@@ -174,7 +184,25 @@ Policy schema, environment variables, and system architecture.
 {bdg-secondary}`Reference`
 :::
 
+:::{grid-item-card} Security Best Practices
+:link: security/best-practices
+:link-type: doc
+
+Every configurable security control, its default, and the risk of changing it.
+
++++
+{bdg-secondary}`Concept`
+:::
+
 ::::
+
+---
+
+```{admonition} Notice and Disclaimer
+:class: warning
+
+This software automatically retrieves, accesses or interacts with external materials. Those retrieved materials are not distributed with this software and are governed solely by separate terms, conditions and licenses. You are solely responsible for finding, reviewing and complying with all applicable terms, conditions, and licenses, and for verifying the security, integrity and suitability of any retrieved materials for your specific use case. This software is provided "AS IS", without warranty of any kind. The author makes no representations or warranties regarding any retrieved materials, and assumes no liability for any losses, damages, liabilities or legal consequences from your use or inability to use this software or any retrieved materials. Use this software and the retrieved materials at your own risk.
+```
 
 ```{toctree}
 :hidden:
@@ -228,6 +256,23 @@ reference/gateway-auth
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
+```
+
+```{toctree}
+:caption: Observability
+:hidden:
+
+observability/index
+observability/logging
+observability/accessing-logs
+observability/ocsf-json-export
+```
+
+```{toctree}
+:caption: Security
+:hidden:
+
+security/best-practices
 ```
 
 ```{toctree}
