@@ -62,9 +62,13 @@ fn resolve_gateway(
     gateway_endpoint: &Option<String>,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
+        // When a gateway name is explicitly provided (via flag or env var),
+        // trust it directly — don't require metadata to exist yet. This
+        // avoids a race condition where mTLS certs are stored under the
+        // real gateway name but the CLI falls back to using the raw
+        // endpoint URL (producing a mangled path like `https___...`).
         let name = gateway_flag
             .clone()
-            .filter(|name| get_gateway_metadata(name).is_some())
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -853,8 +857,12 @@ enum GatewayCommands {
     ///
     /// Registers a gateway endpoint so it appears in `openshell gateway select`.
     ///
-    /// Without extra flags the gateway is treated as an edge-authenticated
-    /// (cloud) gateway and a browser is opened for authentication.
+    /// An `http://...` endpoint is treated as a direct plaintext gateway and
+    /// skips both mTLS certificate extraction and browser authentication.
+    ///
+    /// Without extra flags, an `https://...` endpoint is treated as an
+    /// edge-authenticated (cloud) gateway and a browser is opened for
+    /// authentication.
     ///
     /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway whose
     /// Docker daemon is reachable over SSH. Pass `--local` to register a
@@ -866,7 +874,8 @@ enum GatewayCommands {
     /// for `--remote user@host` with the endpoint derived from the URL.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080` or `ssh://user@host:8080`).
+        /// Gateway endpoint URL (for example `http://127.0.0.1:8080`,
+        /// `https://10.0.0.5:8080`, or `ssh://user@host:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
@@ -874,6 +883,7 @@ enum GatewayCommands {
         name: Option<String>,
 
         /// Register a remote mTLS gateway accessible via SSH.
+        /// With `http://...`, stores a remote plaintext registration instead.
         #[arg(long, conflicts_with = "local")]
         remote: Option<String>,
 
@@ -882,6 +892,7 @@ enum GatewayCommands {
         ssh_key: Option<String>,
 
         /// Register a local mTLS gateway running in Docker on this machine.
+        /// With `http://...`, stores a local plaintext registration instead.
         #[arg(long, conflicts_with = "remote")]
         local: bool,
     },
@@ -1474,6 +1485,30 @@ enum PolicyCommands {
         #[arg(long)]
         yes: bool,
     },
+
+    /// Prove properties of a sandbox policy — or find counterexamples.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Prove {
+        /// Path to OpenShell sandbox policy YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+
+        /// Path to credential descriptor YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        credentials: String,
+
+        /// Path to capability registry directory (default: bundled).
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        registry: Option<String>,
+
+        /// Path to accepted risks YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        accepted_risks: Option<String>,
+
+        /// One-line-per-finding output (for demos and CI).
+        #[arg(long)]
+        compact: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1895,6 +1930,28 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command:
+                Some(PolicyCommands::Prove {
+                    policy,
+                    credentials,
+                    registry,
+                    accepted_risks,
+                    compact,
+                }),
+        }) => {
+            // Prove runs locally — no gateway needed.
+            let exit_code = openshell_prover::prove(
+                &policy,
+                &credentials,
+                registry.as_deref(),
+                accepted_risks.as_deref(),
+                compact,
+            )?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -1964,6 +2021,7 @@ async fn main() -> Result<()> {
                     }
                     run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
+                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 

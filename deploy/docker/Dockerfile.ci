@@ -23,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
+    clang \
+    libclang-dev \
+    libz3-dev \
     pkg-config \
     libssl-dev \
     openssh-client \
@@ -34,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     jq \
     rsync \
+    zstd \
     && apt-get install -y --only-upgrade gpgv python3 \
     && rm -rf /var/lib/apt/lists/*
 
