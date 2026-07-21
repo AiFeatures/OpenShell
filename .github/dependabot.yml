@@ -3,6 +3,14 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
-    cooldown:
-      default-days: 2
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "ci-cd"
+    commit-message:
+      prefix: "ci"
+    groups:
+      iaify-shared:
+        patterns:
+          - "Ai-road-4-You/*"

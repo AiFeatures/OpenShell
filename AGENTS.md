@@ -34,23 +34,11 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
-| `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
+| `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
-| `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
-| `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
-| `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
-| `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
-| `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
-| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
-| `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
-| `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
-| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and inference routing |
-| `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
-| `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
@@ -69,7 +57,6 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 - **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
 - **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
-- **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
@@ -161,14 +148,13 @@ ocsf_emit!(event);
 
 ## Sandbox Infra Changes
 
-- If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
+- If you change sandbox infrastructure, ensure `mise run sandbox` succeeds.
 
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
-- Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
 
 ## Pre-commit
@@ -180,7 +166,7 @@ ocsf_emit!(event);
 
 - `mise run pre-commit` — Lint, format, license headers. Run before every commit.
 - `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
+- `mise run e2e` — End-to-end tests against a running cluster. Run for infrastructure, sandbox, or policy changes.
 - `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
 ## Python
@@ -193,28 +179,14 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change cluster bootstrap infrastructure (e.g., `openshell-bootstrap` crate, `deploy/docker/Dockerfile.images`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Documentation
 
 - When making changes, update the relevant documentation in the `architecture/` directory.
-- When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
-- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
-- `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
-- Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
+- When changes affect user-facing behavior, also update the relevant pages under `docs/`.
+- Follow the style guide in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): active voice, no unnecessary bold, no em dash overuse, no filler introductions.
 - Use the `update-docs` skill to scan recent commits and draft doc updates.
-
-### Architecture Docs
-
-- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
-- Update one of the existing top-level architecture docs before adding a new file.
-- Put useful crate-specific details in the relevant crate `README.md`.
-- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
-- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
-- Remove stale detail instead of preserving it by default.
-- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
-- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
 
 ## Security
 
