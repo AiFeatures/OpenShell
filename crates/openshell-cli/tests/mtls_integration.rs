@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_cli::tls::{TlsOptions, grpc_client};
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
+use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
+use openshell_cli::{
+    run,
+    tls::{TlsOptions, grpc_client},
+};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxRequest,
-    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
-    UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
+    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ServiceStatus, UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
-};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -21,41 +27,6 @@ use tonic::{
     Response, Status,
     transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig},
 };
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, original }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
 
 #[derive(Clone, Default)]
 struct TestOpenShell;
@@ -70,6 +41,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -96,6 +74,33 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::ListSandboxesResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::ListSandboxesResponse::default(),
+        ))
+    }
+
+    async fn list_sandbox_providers(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListSandboxProvidersResponse::default(),
+        ))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::AttachSandboxProviderResponse::default(),
+        ))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::DetachSandboxProviderResponse::default(),
         ))
     }
 
@@ -143,6 +148,36 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
@@ -177,6 +212,48 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn import_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn lint_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -184,6 +261,33 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented(
             "update_provider not implemented in test",
         ))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_provider(
@@ -200,6 +304,9 @@ impl OpenShell for TestOpenShell {
     >;
     type ExecSandboxStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::GatewayMessage, Status>,
+    >;
 
     async fn watch_sandbox(
         &self,
@@ -219,6 +326,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -325,34 +441,97 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
 
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
-}
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::TcpForwardFrame, Status>,
+    >;
+
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 async fn run_server(
@@ -382,8 +561,170 @@ async fn run_server(
     addr
 }
 
+fn write_gateway_mtls_bundle(
+    config_dir: &std::path::Path,
+    gateway_name: &str,
+    ca_cert: &str,
+    client_cert: &str,
+    client_key: &str,
+) {
+    let mtls = config_dir
+        .join("openshell")
+        .join("gateways")
+        .join(gateway_name)
+        .join("mtls");
+    std::fs::create_dir_all(&mtls).unwrap();
+    std::fs::write(mtls.join("ca.crt"), ca_cert).unwrap();
+    std::fs::write(mtls.join("tls.crt"), client_cert).unwrap();
+    std::fs::write(mtls.join("tls.key"), client_key).unwrap();
+}
+
+fn isolated_gateway_add_env(
+    config_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> EnvVarGuard {
+    let xdg_config = config_dir.to_string_lossy().into_owned();
+    let xdg_state = state_dir.to_string_lossy().into_owned();
+    let local_tls_dir = state_dir.join("no-package-managed-tls");
+    let local_tls = local_tls_dir.to_string_lossy().into_owned();
+
+    EnvVarGuard::set(&[
+        ("XDG_CONFIG_HOME", xdg_config.as_str()),
+        ("XDG_STATE_HOME", xdg_state.as_str()),
+        ("HOME", xdg_state.as_str()),
+        ("OPENSHELL_LOCAL_TLS_DIR", local_tls.as_str()),
+        ("OPENSHELL_GATEWAY", "unused-by-named-gateway-add"),
+    ])
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "k8s",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    run::gateway_add(
+        &endpoint,
+        Some("k8s"),
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = get_gateway_metadata("k8s").unwrap();
+    assert_eq!(metadata.name, "k8s");
+    assert_eq!(metadata.gateway_endpoint, endpoint);
+    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+    assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
+    assert!(get_gateway_metadata("openshell").is_none());
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "openshell",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    run::gateway_add(
+        &endpoint,
+        None,
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = get_gateway_metadata("openshell").unwrap();
+    assert_eq!(metadata.name, "openshell");
+    assert_eq!(metadata.gateway_endpoint, endpoint);
+    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+    assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_certs() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "openshell",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let err = run::gateway_add(
+        "https://localhost:1",
+        Some("k8s"),
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect_err("explicit name should require matching named mTLS material");
+
+    assert!(err.to_string().contains("gateway 'k8s'"));
+    assert!(get_gateway_metadata("k8s").is_none());
+    assert!(load_active_gateway().is_none());
+}
+
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
+    let _env = EnvVarGuard::set(&[]);
     install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
@@ -421,7 +762,8 @@ async fn cli_requires_client_cert_for_https() {
     let dir = tempdir().unwrap();
     // Point XDG_CONFIG_HOME at the isolated temp dir so that default_tls_dir
     // cannot discover real client certs from the developer's machine.
-    let _xdg_env = EnvVarGuard::set("XDG_CONFIG_HOME", &dir.path().to_string_lossy());
+    let xdg_path = dir.path().to_string_lossy();
+    let _xdg_env = EnvVarGuard::set(&[("XDG_CONFIG_HOME", &xdg_path)]);
     let ca_path = dir.path().join("ca.crt");
     std::fs::write(&ca_path, ca_cert).unwrap();
 
@@ -429,4 +771,46 @@ async fn cli_requires_client_cert_for_https() {
     let endpoint = format!("https://localhost:{}", addr.port());
     let result = grpc_client(&endpoint, &tls).await;
     assert!(result.is_err());
+}
+
+async fn run_server_no_client_auth(
+    server_cert: String,
+    server_key: String,
+) -> std::net::SocketAddr {
+    let identity = Identity::from_pem(server_cert, server_key);
+    let tls = ServerTlsConfig::new().identity(identity);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = TcpListenerStream::new(listener);
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(OpenShellServer::new(TestOpenShell))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn cli_connects_with_gateway_insecure() {
+    let _env = EnvVarGuard::set(&[]);
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+
+    let addr = run_server_no_client_auth(server_cert, server_key).await;
+
+    let mut tls = TlsOptions::default();
+    tls.gateway_insecure = true;
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+    let response = client.health(HealthRequest {}).await.unwrap();
+    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 }

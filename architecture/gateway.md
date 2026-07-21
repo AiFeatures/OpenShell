@@ -1,579 +1,615 @@
-# Gateway Architecture
+# Gateway
 
-## Overview
+The gateway is the OpenShell control plane. It exposes the API used by the CLI,
+SDK, and TUI; persists platform state; manages provider credentials and
+inference configuration; and asks compute runtimes to create or delete sandbox
+workloads.
 
-`openshell-server` is the gateway -- the central control plane for a cluster. It exposes two gRPC services (OpenShell and Inference) and HTTP endpoints on a single multiplexed port, manages sandbox lifecycle through Kubernetes CRDs, persists state in SQLite or Postgres, and provides SSH tunneling into sandbox pods. The gateway coordinates all interactions between clients, the Kubernetes cluster, and the persistence layer.
+## Responsibilities
 
-## Architecture Diagram
+- Authenticate clients and sandbox callbacks.
+- Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
+  settings, inference configuration, logs, watch streams, and relay forwarding.
+- Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
+- Persist domain objects in SQLite or Postgres.
+- Resolve provider credentials and inference bundles for sandbox supervisors.
+- Coordinate supervisor relay sessions for connect, exec, file sync, and
+  service forwarding.
 
-The following diagram shows the major components inside the gateway process and their relationships.
+The gateway does not enforce agent network policy at request time. That happens
+inside each sandbox, where the supervisor and proxy can observe local process
+identity.
+
+## Protocol and Auth
+
+The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
+The default local single-user deployment mode is mTLS user authentication:
+clients present a certificate signed by the local deployment CA, and the
+gateway maps the verified certificate subject to a user principal. Kubernetes
+deployments use mTLS for transport only and require OIDC or a trusted access
+proxy for user authentication unless the explicit unsafe local-development
+`allow_unauthenticated_users` switch is enabled.
+When that service port is bound to loopback, the listener can also accept
+plaintext HTTP on the same port for sandbox service subdomains only. That local
+browser path is enabled by default and disabled with
+`--enable-loopback-service-http=false`; it never serves gateway APIs, auth,
+health, metrics, or tunnel routes. The plaintext service router also rejects
+browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
+cross-origin or sibling-subdomain request.
+
+Operators can configure a gateway-wide gRPC request rate limit. The limit is
+applied only to gRPC API traffic after protocol multiplexing; health, metrics,
+and local sandbox-service HTTP routes are not rate limited by this control.
+
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Only unary OpenShell methods in the
+gateway's explicit interceptable-method allowlist are decoded through the
+descriptor set into protobuf JSON, evaluated through configured phases, and
+re-encoded before the handler sees the request. New RPCs are non-interceptable
+until deliberately added to this allowlist. Interception remains centralized:
+allowlisting a unary RPC does not require method-specific gateway
+instrumentation.
+
+Each configured interceptor selects a binding policy. `dynamic` accepts valid
+manifest declarations and preserves the compatibility behavior. `allowlist`
+enables only operator-configured RPCs and phases, while `exact` requires the
+configured and declared sets to match. Strict policies match by RPC rather than
+manifest binding ID, so renaming a binding does not change authority. Provider
+profile sources remain a separate operator-controlled capability.
+
+The protobuf schema marks dedicated credential, token, and refresh-material
+fields with a custom secret option. The middleware recursively omits those
+fields from every request and post-commit response sent to an interceptor while
+retaining the complete protobuf operation for handler dispatch. JSON Patch
+paths and source paths cannot select an omitted field or replace a containing
+object. There is no configuration that exposes annotated fields.
+
+`SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
+change active policy through the gateway's approval workflow. An interceptor
+may therefore reject policy proposals while permitting telemetry-only requests.
+Gateways without a matching binding retain the standard proposal behavior.
+
+The descriptor codec uses protobuf's standard `oneof` semantics. If binary
+input contains multiple alternatives from one group, the last member on the
+wire wins. The middleware converts that selected value to ProtoJSON and
+re-encodes it before dispatch, so the interceptor and handler observe the same
+canonical request. ProtoJSON input that names multiple alternatives remains
+invalid.
+
+Modification results are atomic per binding. After applying one binding's full
+JSON Patch list, the middleware re-encodes the candidate as the request's
+protobuf type and decodes those accepted bytes back to canonical ProtoJSON.
+Invalid candidates follow that binding's failure policy: fail-open restores the
+exact pre-binding operation, while fail-closed rejects the request before
+handler dispatch. Later bindings only observe the same schema-valid operation
+that the handler will receive; protobuf map entry ordering is not treated as a
+semantic difference.
+
+Each interceptor evaluation selects exactly one phase payload:
+`modify_operation`, `validate`, or `post_commit`. Modification and validation
+payloads carry the protobuf JSON operation entering that phase. Post-commit
+payloads carry the successful committed response instead of echoing the
+request. Only the `validate` payload can also carry optional read-only
+`current_state`; modification and post-commit evaluations never receive it. The
+gateway does not yet load method-specific state, so the field remains absent;
+an absent state is distinct from an explicitly empty object. Method-specific
+state schemas and persistence-version binding are deferred until a concrete
+consumer requires them.
+
+Post-commit evaluation is strictly observational. A binding that includes
+`post_commit` must resolve to `fail_open`, or interceptor initialization fails.
+After a handler returns success, failures never replace the committed response.
+Binding failures emit the standard fail-open warning and counter; response
+observation or evaluation failures outside binding policy emit warnings and the
+`openshell_gateway_interceptor_post_commit_observation_failures_total` metric.
+The gateway reconstructs the original response frames, including trailers and
+body errors, before evaluating the observer.
+
+Interceptor manifests can also vend provider profile catalogs. Gateway
+configuration selects the exact ordered source set from the in-tree built-in
+source, the stored user source, and named profile-capable interceptors. Omitting
+the setting selects `builtin + user`; selecting only an interceptor makes it
+authoritative by omission. Every selected source uses the same snapshot,
+semantic-validation, and duplicate-detection path. Duplicate normalized profile
+IDs fail instead of creating source precedence. The gateway treats configured
+interceptors as trusted sources and does not verify signature annotations in
+their profile payloads.
+
+Each logical gateway request captures the selected sources into one validated,
+immutable effective catalog before deriving provider behavior. Policy layers,
+credential scope, injected environment material, dynamic token grants, and
+provider-environment revisions use that same catalog. Each configured source is
+therefore fetched at most once per request, and a source revision change becomes
+visible on the next request instead of partway through the current request. The
+capture emits debug diagnostics with the combined catalog revision, source fetch
+count, and profile count; it never logs provider credentials or profile material.
+
+Supported auth modes:
+
+| Mode | Use |
+|---|---|
+| mTLS user auth | Local single-user Docker, Podman, and VM gateway access. |
+| Plaintext | Local development or a trusted reverse proxy boundary. |
+| Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
+| Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
+| OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
+
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
+does not grant sandbox identity. Kubernetes deployments use the
+gateway-minted JWT bootstrap path: the supervisor starts with a projected
+ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
+that JWT on subsequent gateway RPCs.
+User-facing mutations are authorized by role policy when OIDC or edge identity
+is enabled.
+
+Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
+Podman, and VM drivers deliver the initial token through supervisor-only
+runtime material; Kubernetes supervisors exchange a projected ServiceAccount
+token through `IssueSandboxToken`. The gateway validates that projected token
+with Kubernetes `TokenReview`, requires the configured sandbox service account,
+checks the returned pod binding against the live pod UID, and verifies the pod's
+controlling `Sandbox` ownerReference against the live Sandbox CR UID and
+sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
+controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
+deployments. Supervisors renew gateway JWTs in memory before expiry only while
+the sandbox record still exists. Older tokens are not server-revoked; shared
+deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+The config default is
+`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
+gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
+shared deployments should set a positive TTL.
+
+Gateway JWT signing-key rotation is currently an offline operator action. The
+runtime loads one active signing key and one matching public verification key
+from the configured secret at startup. To rotate that key material today,
+operators must delete or replace the JWT key secret, let certgen recreate it,
+and restart the gateway pods. This invalidates outstanding supervisor tokens;
+running supervisors recover by re-running their bootstrap path where available
+or by reconnecting after sandbox restart. Online rotation with multiple
+verification keys keyed by `kid` is tracked separately.
+
+Sandbox JWTs are not user credentials. The gRPC router accepts
+`Principal::Sandbox` only on the supervisor-to-gateway RPC allowlist
+(`ConnectSupervisor`, `RelayStream`, token renewal, config sync, policy status,
+log push, and policy-analysis callbacks). Handlers then compare the
+authenticated sandbox ID with any sandbox ID or name resolved from the request.
+Supervisor control and relay streams require a matching sandbox principal before
+the gateway registers the session or bridges relay bytes.
+
+## API Surface
+
+The gateway API is organized around platform objects and operational streams:
+
+| Area | Examples |
+|---|---|
+| Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
+| Providers | Store provider records, discover credentials, resolve runtime environment. |
+| Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
+| Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
+| Observability | Push sandbox logs, stream sandbox status and logs to clients. |
+
+Domain objects use shared metadata: stable server-generated IDs, human-readable
+names, creation timestamps, and labels. Crate-level details live in
+`crates/openshell-core/README.md`.
+
+## Persistence
+
+The gateway persistence layer is a protobuf object store. Domain services store
+typed protobuf messages as opaque binary payloads, while the database keeps a
+small set of indexed metadata columns for lookup, listing, versioning, and
+workflow state. The implementation lives in the
+[gateway persistence module](../crates/openshell-server/src/persistence/mod.rs);
+backend-specific SQL lives in the SQLite and Postgres migration directories
+under `crates/openshell-server/migrations/`.
+
+The storage schema is intentionally narrow:
+
+| Column | Purpose |
+|---|---|
+| `id` | Stable gateway-generated object ID and primary key. |
+| `object_type` | Logical resource kind, such as `sandbox`, `provider`, `ssh_session`, `inference_route`, `sandbox_policy`, or `draft_policy_chunk`. |
+| `name` | Human-readable name, unique within an object type when present. |
+| `scope` | Optional owner or namespace for scoped/versioned records, such as a sandbox ID for policy revisions. |
+| `version` | Optional monotonically increasing version for scoped records. |
+| `status` | Optional workflow state for records such as policy revisions or draft policy chunks. |
+| `dedup_key` and `hit_count` | Optional policy-advisor fields for coalescing repeated observations. |
+| `resource_version` | Monotonically increasing counter for optimistic concurrency control. Incremented atomically on each update. |
+| `payload` | Prost-encoded protobuf payload for the full domain object. |
+| `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
+| `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
+
+Common resources use generic helpers that derive `object_type`, `id`, `name`,
+and labels from protobuf metadata traits before encoding the full message into
+`payload`. Policy revisions and draft policy chunks use the same table but also
+populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
+gateway can efficiently fetch the latest policy, track load status, and manage
+advisor drafts without creating resource-specific tables.
+
+Each sandbox policy revision stores the complete provenance annotation map
+supplied with that update. The revision payload is the authoritative immutable
+record; sandbox metadata receives the same annotations only as a convenience
+projection and can retain keys from earlier revisions. Policy revision creation,
+optional first-policy backfill, metadata projection, and superseding older
+revisions commit in one database transaction. SQLite serializes this operation
+with an immediate transaction, while Postgres locks the sandbox row. A failed
+resource-version check or revision insert rolls back the entire operation.
+
+SQLite is the default local store; Postgres is supported for deployments that
+need an external database or multi-replica coordination. Both backends expose
+the same `Store` API and the same logical schema. Backend differences stay
+inside the adapters: for example, SQLite stores labels as JSON text and payloads
+as `BLOB`, while Postgres stores labels as `JSONB` and payloads as `BYTEA`.
+Domain code should depend on the object-store contract, not SQL dialect details.
+This keeps the gateway data model portable across storage backends and leaves
+room for future stores that can provide the same object, label, version, and
+scope semantics.
+
+The SQLite adapter tightens the on-disk database file to mode `0o600` on every
+connect so that provider API keys, SSH session tokens, and sandbox metadata are
+not readable by other local users on shared hosts. The same restriction is
+reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
+default WAL journal mode), which mirror the same sensitive contents.
+
+Persisted state includes sandboxes, providers, provider credential refresh
+state, SSH sessions, policy revisions, settings, inference configuration, and
+deployment records. Provider refresh material is stored as a separate object
+scoped to the provider instance through `objects.scope`; the provider record
+keeps only the current injectable credential values and optional per-credential
+expiry timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint.
+
+### Optimistic Concurrency (CAS)
+
+Every object row carries a `resource_version` that the database increments
+atomically on each write. Concurrent mutations use compare-and-swap (CAS): the
+writer reads the current version, applies changes, and writes back with a
+`WHERE resource_version = <expected>` guard. If another writer updated the row
+in between, the guard fails and the caller receives a `Conflict` error.
+
+This matters for HA deployments where multiple gateway replicas share the same
+Postgres database, and for single-node deployments where concurrent gRPC
+handlers or the reconciler mutate the same sandbox.
+
+**Compile-time enforcement.** The unconditional write methods `put` and
+`put_message` are gated behind `#[cfg(test)]`. Production code must use
+`put_if` with an explicit `WriteCondition` or `update_message_cas`. The
+compiler rejects any other write path, making non-CAS writes structurally
+impossible outside of tests.
+
+Every write goes through one of three conditions:
+
+- `MustCreate` -- insert-only. The database rejects the write with a
+  `UniqueViolation` error if a row with that ID already exists. Handlers match
+  on the structured `PersistenceError::UniqueViolation { .. }` variant to
+  distinguish creation conflicts from other failures.
+- `MatchResourceVersion(v)` -- update-only. The database rejects the write
+  with a `Conflict` error if the current version differs from `v`.
+- `Unconditional` -- test-only; not reachable in production builds.
+
+**Creates.** All create paths use `MustCreate` and hydrate the response
+directly from the `WriteResult` returned by `put_if`, which carries the
+assigned `resource_version`, `created_at_ms`, and `updated_at_ms`. This
+eliminates a read-after-write round trip and the race window that would come
+with it.
+
+**Updates.** The `update_message_cas` helper makes a single CAS attempt: it
+fetches the current object, applies a mutation closure, and writes with a
+`MatchResourceVersion` condition. On conflict the persistence layer returns a
+`Conflict` error, which gRPC handlers map to `ABORTED` status so the client
+(or the next watch/reconcile event) can retry with fresh state. There is no
+automatic retry loop.
+
+The helper accepts an `expected_version` parameter that selects between two
+modes:
+
+- **Server-driven** (`expected_version = 0`): the helper uses the version it
+  just read from the database. Internal operations (reconciler, policy status
+  reports, compute phase transitions) use this mode because the caller does
+  not track versions.
+- **Client-driven** (`expected_version != 0`): the helper validates that the
+  caller's version matches the current database version before applying the
+  mutation. If they diverge it returns `Conflict` without attempting the
+  write. Client-facing operations that carry an `expected_resource_version`
+  field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
+  `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
+  backfill and sandbox annotation updates).
+
+**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
+protobuf payloads from list results and hydrate `resource_version` from the
+authoritative database column into each decoded message, mirroring the
+`get_message` pattern. This ensures list responses carry correct versions
+without requiring callers to manually hydrate each record.
+
+**Deletes.** Delete operations are not yet CAS-protected -- the delete request
+protos do not carry `expected_resource_version`. A `delete_if` primitive exists
+in the persistence layer but is not wired into gRPC handlers.
+
+**Coverage.** All `ObjectMeta`-bearing message types have write-condition
+coverage:
+
+| Type | Create | Update | List |
+|---|---|---|---|
+| Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
+| Provider | `MustCreate` | `update_message_cas` | `list_messages` |
+| ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
+| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
+| SandboxPolicy | scoped versioning | scoped versioning | scoped query |
+| Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
+
+Global settings updates use a Tokio `Mutex` to serialize multi-step
+validation within a single gateway process, with CAS on the underlying
+persistence write as defense in depth. In an HA deployment with multiple
+gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
+rely entirely on CAS without a Mutex.
+
+The `resource_version` is surfaced to clients through `ObjectMeta` in proto
+responses. Provider profiles are the exception: custom profile get/list/export
+responses copy the stored version onto the profile payload so exported YAML can
+carry the expected version for safe single-profile updates. Profile update
+requests also carry an explicit target profile ID; the payload ID must match the
+target so an edited export cannot overwrite a different profile. Database
+migrations backfill existing rows with version 1.
+
+Provider profile imports, updates, and deletes hold the sandbox synchronization
+guard while checking attached-sandbox dynamic token grant ambiguity or in-use
+state and writing the profile record. Sandbox creation with initial providers and
+sandbox provider attach/detach use the same guard, so one gateway process cannot
+interleave a profile mutation with a sandbox provider-set mutation that would
+leave an ambiguous final dynamic-token state or a deleted custom profile that is
+still referenced by a sandbox.
+
+Policy and runtime settings are delivered together through the effective sandbox
+config path. A gateway-global policy can override sandbox-scoped policy. The
+sandbox supervisor polls for config revisions and hot-reloads dynamic policy
+when the policy engine accepts the update.
+
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
+
+Provider credential expiry is enforced during gateway-to-sandbox credential
+resolution and again by the sandbox placeholder resolver. This keeps expired
+credentials from resolving even when a running sandbox still has retained
+placeholder generations from an earlier provider credential snapshot.
+
+## Inference Resolution
+
+Cluster inference routes store only `provider_name`, `model_id`, and optional
+timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
+style, and route-shaping metadata from the provider record when supervisors call
+`GetInferenceBundle`. Supported provider types for cluster inference are
+`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
+
+The bundle carries enough information for sandbox-local routers to construct
+upstream URLs without re-deriving provider-specific routing logic. Each resolved
+route may include:
+
+| Field | Meaning |
+|---|---|
+| `model_in_path` | When true, the model identifier is part of the upstream URL path, not only the request body. |
+| `request_path_override` | Path override or suffix. With `model_in_path=false`, replaces the protocol-derived path; with `model_in_path=true`, appended after the model ID. |
+
+For standard providers these fields stay unset and the sandbox router uses default
+protocol paths. Vertex AI is model-aware: the gateway constructs the base URL
+from provider config (`VERTEX_AI_PROJECT_ID`, `VERTEX_AI_REGION`, optional
+`VERTEX_AI_PUBLISHER`) and emits route-shaping metadata so the sandbox router
+stays provider-agnostic.
+
+Host selection follows the configured region:
+
+| Region value | Vertex host |
+|---|---|
+| `global` | `aiplatform.googleapis.com` |
+| `us` or `eu` | `aiplatform.{region}.rep.googleapis.com` |
+| Any other (e.g. `us-central1`) | `{region}-aiplatform.googleapis.com` |
+
+Route shaping by publisher:
+
+- **Anthropic (Claude)** — `model_in_path=true`, base path under
+  `publishers/anthropic/models`, protocol `anthropic_messages` only. The gateway
+  resolves `request_path_override=:rawPredict`; the sandbox router keeps
+  `:rawPredict` for buffered requests and upgrades to `:streamRawPredict` only
+  for streaming proxy calls.
+- **All other models** (Gemini, third-party, unknown) — OpenAI-compatible
+  `.../endpoints/openapi` base with `request_path_override=/chat/completions`;
+  protocol `openai_chat_completions`.
+
+Callers may supply `GOOGLE_VERTEX_AI_BASE_URL` or `VERTEX_AI_BASE_URL` only for
+non-Anthropic routes. Anthropic base URL overrides are rejected because they
+cannot safely preserve model-path shaping and `anthropic_version` body
+adaptation. Overrides still pin `request_path_override=/chat/completions` and
+must use `https` with an official Vertex AI hostname (`aiplatform.googleapis.com`,
+`aiplatform.{us,eu}.rep.googleapis.com`, or `{region}-aiplatform.googleapis.com`).
+
+Header passthrough is protocol-dependent. Vertex Claude rawPredict routes strip
+client `anthropic-beta` headers; `anthropic-version` is not forwarded because
+the sandbox router injects `anthropic_version` into the request body for Vertex
+rawPredict. Non-Anthropic Vertex routes do not inherit Anthropic passthrough
+headers.
+
+For `google-vertex-ai` providers created with CLI `--from-gcloud-adc`, the CLI
+calls gateway `ConfigureProviderRefresh` with OAuth2 refresh material from gcloud
+ADC, then `RotateProviderCredential` to mint the first access token before
+reporting success. ADC-backed providers mint into `GOOGLE_VERTEX_AI_TOKEN`. A
+successful create therefore yields an immediately usable provider; failures roll
+back the provider record. Service-account JSON and private keys are gateway-side
+refresh bootstrap material only; sandbox runtime inference receives minted
+access tokens, not raw service-account material.
+
+## Supervisor Relay
+
+Sandbox workloads maintain an outbound supervisor session to the gateway. This
+lets the gateway open per-request byte relays without requiring inbound network
+access to the sandbox workload.
 
 ```mermaid
-graph TD
-    Client["gRPC / HTTP Client"]
-    TCP["TCP Listener"]
-    TLS["TLS Acceptor<br/>(optional)"]
-    MUX["MultiplexedService"]
-    GRPC_ROUTER["GrpcRouter"]
-    NAV["OpenShellServer<br/>(OpenShell service)"]
-    INF["InferenceServer<br/>(Inference service)"]
-    HTTP["HTTP Router<br/>(Axum)"]
-    HEALTH["Health Endpoints"]
-    SSH_TUNNEL["SSH Tunnel<br/>(/connect/ssh)"]
-    STORE["Store<br/>(SQLite / Postgres)"]
-    K8S["Kubernetes API"]
-    WATCHER["Sandbox Watcher"]
-    EVENT_TAILER["Kube Event Tailer"]
-    WATCH_BUS["SandboxWatchBus"]
-    LOG_BUS["TracingLogBus"]
-    PLAT_BUS["PlatformEventBus"]
-    INDEX["SandboxIndex"]
+sequenceDiagram
+    participant CLI
+    participant GW as Gateway
+    participant SUP as Sandbox supervisor
+    participant Target as Sandbox target
 
-    Client --> TCP
-    TCP --> TLS
-    TLS --> MUX
-    MUX -->|"content-type: application/grpc"| GRPC_ROUTER
-    MUX -->|"other"| HTTP
-    GRPC_ROUTER -->|"/openshell.inference.v1.Inference/*"| INF
-    GRPC_ROUTER -->|"all other paths"| NAV
-    HTTP --> HEALTH
-    HTTP --> SSH_TUNNEL
-    NAV --> STORE
-    NAV --> K8S
-    INF --> STORE
-    SSH_TUNNEL --> STORE
-    SSH_TUNNEL --> K8S
-    WATCHER --> K8S
-    WATCHER --> STORE
-    WATCHER --> WATCH_BUS
-    WATCHER --> INDEX
-    EVENT_TAILER --> K8S
-    EVENT_TAILER --> PLAT_BUS
-    EVENT_TAILER --> INDEX
-    LOG_BUS --> PLAT_BUS
+    SUP->>GW: ConnectSupervisor stream
+    CLI->>GW: ForwardTcp / exec / sync request
+    GW->>SUP: RelayOpen(channel, target)
+    SUP->>Target: Dial SSH socket or loopback service
+    SUP->>GW: RelayStream(channel)
+    CLI->>GW: Client bytes
+    GW-->>CLI: Client bytes
+    GW->>SUP: Relay bytes
+    SUP-->>GW: Relay bytes
 ```
 
-## Source Layout
+The same relay pattern backs interactive SSH, command execution, file sync, and
+local service forwarding. The gateway tracks live sessions in memory and
+persists session records so tokens can expire or be revoked.
 
-| Module | File | Purpose |
-|--------|------|---------|
-| Entry point | `crates/openshell-server/src/main.rs` | CLI argument parsing, config assembly, tracing setup, calls `run_server` |
-| Gateway runtime | `crates/openshell-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
-| Protocol mux | `crates/openshell-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
-| gRPC: OpenShell | `crates/openshell-server/src/grpc.rs` | `OpenShellService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
-| gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
-| HTTP | `crates/openshell-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
-| Browser auth | `crates/openshell-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
-| SSH tunnel | `crates/openshell-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
-| WS tunnel | `crates/openshell-server/src/ws_tunnel.rs` | WebSocket tunnel handler at `/_ws_tunnel` for Cloudflare-fronted clients |
-| TLS | `crates/openshell-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
-| Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
-| Persistence: SQLite | `crates/openshell-server/src/persistence/sqlite.rs` | `SqliteStore` with sqlx |
-| Persistence: Postgres | `crates/openshell-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
-| Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
-| Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete, endpoint resolution, watch stream, pod template translation |
-| Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
-| Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
-| Tracing bus | `crates/openshell-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
+Relay liveness has two backstops so a reset supervisor session cannot leave a
+request parked forever. The gateway runs server-side HTTP/2 keepalive on
+supervisor connections, and each exec relay's SSH client uses SSH keepalive: an
+exec channel may be legitimately silent for a long time (e.g. an agent whose
+stdout is redirected to a file), so the exec is never ended on output-idle
+alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
+channel and returns the exec with an error. Once a command reports its exit
+status, the gateway also bounds how long it waits for the trailing channel close.
 
-Proto definitions consumed by the gateway:
+`ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
+The first frame is a `TcpForwardInit` that carries the sandbox ID, an
+authorization token from `CreateSshSession`, and an explicit target:
+`target.ssh` for the sandbox SSH socket or `target.tcp` for a loopback service
+inside the sandbox. The gateway validates the token and sandbox readiness,
+sends a targeted `RelayOpen` to the supervisor, then bridges
+`TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
 
-| Proto file | Package | Defines |
-|------------|---------|---------|
-| `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, public sandbox resource model, provider/SSH/watch messages |
-| `proto/compute_driver.proto` | `openshell.compute.v1` | Internal `ComputeDriver` service, driver-native sandbox observations, endpoint resolution, compute watch stream envelopes |
-| `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
-| `proto/datamodel.proto` | `openshell.datamodel.v1` | `Provider` |
-| `proto/sandbox.proto` | `openshell.sandbox.v1` | Sandbox supervisor policy, settings, and config messages |
+Browser service URLs use the same supervisor relay path after host-based
+routing resolves `sandbox--service.<service-routing-domain>` to a stored
+service endpoint. Accepted service routing domains are derived from wildcard
+DNS SANs configured on the gateway server certificate, with
+`openshell.localhost` available by default for loopback gateways. TLS-enabled
+loopback gateways print `http://` URLs when loopback plaintext service HTTP is
+enabled; non-loopback TLS gateways continue to print `https://` URLs.
 
-## Startup Sequence
+For `target.tcp`, the gateway only accepts loopback destinations such as
+`localhost`, `127.0.0.0/8`, or `::1`. The gateway never needs to know or dial a
+sandbox pod IP; supervisors connect outbound and bridge only the explicit target
+requested for that relay.
 
-The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and proceeds through these steps:
+## PKI Bootstrap
 
-1. **Install rustls crypto provider** -- `aws_lc_rs::default_provider().install_default()`.
-2. **Parse CLI arguments** -- `Args::parse()` via `clap`. Every flag has a corresponding environment variable (see [Configuration](#configuration)).
-3. **Initialize tracing** -- Creates a `TracingLogBus` and installs a tracing subscriber that writes to stdout and publishes log events keyed by `sandbox_id` into the bus.
-4. **Build `Config`** -- Assembles a `openshell_core::Config` from the parsed arguments.
-5. **Call `run_server()`** (`crates/openshell-server/src/lib.rs`):
-   1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
-   2. Create `ComputeRuntime` with the in-process Kubernetes compute backend (`KubernetesComputeDriver`).
-   3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
-   4. **Spawn background tasks**:
-      - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, updates persisted sandbox records, and republishes platform events.
-   5. Create `MultiplexService`.
-   6. Bind `TcpListener` on `config.bind_address`.
-   7. Optionally create `TlsAcceptor` from cert/key files.
-   8. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
+`openshell-gateway generate-certs` is the one place local mTLS materials and
+sandbox JWT signing material are created. Deployment paths use it as follows:
+
+| Output mode | Selector | Layout |
+|---|---|---|
+| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name`, `--jwt-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt` plus one Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Kubernetes JWT-only Secret | `--namespace`, `--jwt-only`, `--jwt-secret-name` | One Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}, jwt/{signing.pem,public.pem,kid}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
+
+On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
+hook Job using the gateway image itself -- no separate cert-generation image,
+no extra mirror burden in air-gapped environments. In the default built-in PKI
+path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
+cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
+required sandbox JWT Secret still exists before the gateway workload mounts it,
+even if `pkiInitJob.enabled` remains true. On package-managed local
+gateways, the same command runs from the systemd
+unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
+on first start. The Linux package unit defaults that directory to
+`~/.local/state/openshell/tls` through `OPENSHELL_LOCAL_TLS_DIR` so certificate
+generation and runtime auto-detection use the same path across systemd
+versions.
+
+The bootstrap paths share the same idempotency contract: all requested targets
+present -> skip; partial requested state -> fail with a recovery hint; nothing
+requested present -> generate and write. This guards continuity across restarts
+and upgrades while still recovering cleanly if an operator deletes everything
+and starts over.
+
+Operators who manage TLS PKI with cert-manager enable `certManager.enabled`;
+cert-manager takes precedence over built-in TLS generation and the chart still
+renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can
+disable both `pkiInitJob.enabled` and `certManager.enabled`.
 
 ## Configuration
 
-All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is the only required argument.
-
-| Flag | Env Var | Default | Description |
-|------|---------|---------|-------------|
-| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
-| `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
-| `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
-| `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
-| `--tls-client-ca` | `OPENSHELL_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
-| `--disable-tls` | `OPENSHELL_DISABLE_TLS` | `false` | Listen on plaintext HTTP behind a trusted reverse proxy or tunnel |
-| `--disable-gateway-auth` | `OPENSHELL_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients and rely on application-layer auth |
-| `--client-tls-secret-name` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
-| `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/openshell/openshell.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
-| `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
-| `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
-| `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
-| `--ssh-gateway-host` | `OPENSHELL_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
-| `--ssh-gateway-port` | `OPENSHELL_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
-| `--ssh-connect-path` | `OPENSHELL_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
-| `--sandbox-ssh-port` | `OPENSHELL_SANDBOX_SSH_PORT` | `2222` | SSH listen port inside sandbox pods |
-| `--ssh-handshake-secret` | `OPENSHELL_SSH_HANDSHAKE_SECRET` | None | Shared HMAC-SHA256 secret for gateway-to-sandbox handshake |
-| `--ssh-handshake-skew-secs` | `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `300` | Allowed clock skew (seconds) for SSH handshake timestamps |
-
-## Shared State
-
-All handlers share an `Arc<ServerState>` (`crates/openshell-server/src/lib.rs`):
-
-```rust
-pub struct ServerState {
-    pub config: Config,
-    pub store: Arc<Store>,
-    pub compute: ComputeRuntime,
-    pub sandbox_index: SandboxIndex,
-    pub sandbox_watch_bus: SandboxWatchBus,
-    pub tracing_log_bus: TracingLogBus,
-    pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
-    pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
-    pub settings_mutex: tokio::sync::Mutex<()>,
-}
-```
-
-- **`store`** -- persistence backend (SQLite or Postgres) for all object types.
-- **`compute`** -- gateway-owned compute orchestration. Persists sandbox lifecycle transitions, validates create requests through the compute backend, resolves exec/SSH endpoints, consumes the backend watch stream, and periodically reconciles orphaned `Provisioning` records that no longer have a backing compute resource.
-- **`sandbox_index`** -- in-memory bidirectional index mapping sandbox names and agent pod names to sandbox IDs. Updated from compute-driver sandbox snapshots.
-- **`sandbox_watch_bus`** -- `broadcast`-based notification bus keyed by sandbox ID. Producers call `notify(&id)` when the persisted sandbox record changes; consumers in `WatchSandbox` streams receive `()` signals and re-read the record.
-- **`tracing_log_bus`** -- captures `tracing` events that include a `sandbox_id` field and republishes them as `SandboxLogLine` messages. Maintains a per-sandbox tail buffer (default 200 entries). Also contains a nested `PlatformEventBus` for compute-driver platform events.
-- **`settings_mutex`** -- serializes settings mutations (global and sandbox) to prevent read-modify-write races. Held for the duration of any setting set/delete or global policy set/delete operation. See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle).
-
-## Protocol Multiplexing
-
-All traffic (gRPC and HTTP) shares a single TCP port. Multiplexing happens at the request level, not the connection level.
-
-### Connection Handling
-
-`MultiplexService::serve()` (`crates/openshell-server/src/multiplex.rs`) creates per-connection service instances:
-
-1. Each accepted TCP stream (optionally TLS-wrapped) is passed to `hyper_util::server::conn::auto::Builder`, which auto-negotiates HTTP/1.1 or HTTP/2.
-2. The builder calls `serve_connection_with_upgrades()`, which supports HTTP upgrades (needed for the SSH tunnel's CONNECT method).
-3. For each request, `MultiplexedService` inspects the `content-type` header:
-   - **Starts with `application/grpc`** -- routes to `GrpcRouter`.
-   - **Anything else** -- routes to the Axum HTTP router.
-
-### gRPC Sub-Routing
-
-`GrpcRouter` (`crates/openshell-server/src/multiplex.rs`) further routes gRPC requests by URI path prefix:
-
-- Paths starting with `/openshell.inference.v1.Inference/` go to `InferenceServer`.
-- All other gRPC paths go to `OpenShellServer`.
-
-### Body Type Normalization
-
-Both gRPC and HTTP handlers produce different response body types. `MultiplexedService` normalizes them through a custom `BoxBody` wrapper (an `UnsyncBoxBody<Bytes, Box<dyn Error>>`) so that Hyper receives a uniform response type.
-
-### TLS + mTLS
-
-When TLS is enabled (`crates/openshell-server/src/tls.rs`):
-
-- `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig`, and configures ALPN to advertise `h2` and `http/1.1`.
-- When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--disable-gateway-auth` keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
-- `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
-- Supports PKCS#1, PKCS#8, and SEC1 private key formats.
-- The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
-- Certificates are generated at cluster bootstrap time by the `openshell-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
-- **Certificate lifetime**: Certificates use `rcgen` defaults (effectively never expire), which is appropriate for an internal dev-cluster PKI where certs are ephemeral to the cluster's lifetime.
-- **Redeploy behavior**: On redeploy, existing cluster TLS secrets are loaded and reused if they are complete and valid PEM. If secrets are missing, incomplete, or malformed, fresh PKI is generated. If rotation occurs and the openshell workload is already running, the bootstrap performs a rollout restart and waits for completion before persisting CLI-side credentials.
-
-## gRPC Services
-
-### OpenShell Service
-
-Defined in `proto/openshell.proto`, implemented in `crates/openshell-server/src/grpc.rs` as `OpenShellService`.
-
-#### Sandbox Management
-
-| RPC | Description | Key behavior |
-|-----|-------------|--------------|
-| `Health` | Returns service status and version | Always returns `HEALTHY` with `CARGO_PKG_VERSION` |
-| `CreateSandbox` | Create a new sandbox | Validates spec and policy, validates provider names exist (fail-fast), persists to store, creates Kubernetes CRD. On K8s 409 conflict or error, rolls back the store record and index entry. |
-| `GetSandbox` | Fetch sandbox by name | Looks up by name via `store.get_message_by_name()` |
-| `ListSandboxes` | List sandboxes | Paginated (default limit 100), decodes protobuf payloads from store records |
-| `DeleteSandbox` | Delete sandbox by name | Sets phase to `Deleting`, persists, notifies watch bus, then deletes the Kubernetes CRD. Cleans up store if the CRD was already gone. |
-| `WatchSandbox` | Stream sandbox updates | Server-streaming RPC. See [Watch Sandbox Stream](#watch-sandbox-stream) below. |
-| `ExecSandbox` | Execute command in sandbox | Server-streaming RPC. See [Remote Exec via SSH](#remote-exec-via-ssh) below. |
-
-#### SSH Session Management
-
-| RPC | Description |
-|-----|-------------|
-| `CreateSshSession` | Creates a session token for a `Ready` sandbox. Persists an `SshSession` record and returns gateway connection details (host, port, scheme, connect path). |
-| `RevokeSshSession` | Marks a session as revoked by setting `session.revoked = true` in the store. |
-
-#### Provider Management
-
-Full CRUD for `Provider` objects, which store typed credentials (e.g., API keys for Claude, GitLab tokens).
-
-| RPC | Description |
-|-----|-------------|
-| `CreateProvider` | Creates a provider. Requires `type` field; auto-generates a 6-char name if not provided. Rejects duplicates by name. |
-| `GetProvider` | Fetches a provider by name. |
-| `ListProviders` | Paginated list (default limit 100). |
-| `UpdateProvider` | Updates an existing provider by name. Preserves the stored `id` and `name`; replaces `type`, `credentials`, and `config`. |
-| `DeleteProvider` | Deletes a provider by name. Returns `deleted: true/false`. |
-
-#### Policy, Settings, and Provider Environment Delivery
-
-These RPCs are called by sandbox pods at startup and during runtime polling.
-
-| RPC | Description |
-|-----|-------------|
-| `GetSandboxSettings` | Returns effective sandbox config looked up by sandbox ID: policy payload, policy metadata (version, hash, source, `global_policy_version`), merged effective settings, and a `config_revision` fingerprint for change detection. Two-tier resolution: registered keys start unset, sandbox values overlay, global values override. The reserved `policy` key in global settings can override the sandbox's own policy. When a global policy is active, `policy_source` is `GLOBAL` and `global_policy_version` carries the active revision number. See [Gateway Settings Channel](gateway-settings.md). |
-| `GetGatewaySettings` | Returns gateway-global settings only (excluding the reserved `policy` key). Returns registered keys with empty values when unconfigured, and a monotonic `settings_revision`. |
-| `GetSandboxProviderEnvironment` | Resolves provider credentials into environment variables for a sandbox. Iterates the sandbox's `spec.providers` list, fetches each `Provider`, and collects credential key-value pairs. First provider wins on duplicate keys. Skips credential keys that do not match `^[A-Za-z_][A-Za-z0-9_]*$`. |
-
-#### Policy Recommendation (Network Rules)
-
-These RPCs support the sandbox-initiated policy recommendation pipeline. The sandbox generates proposals via its mechanistic mapper and submits them; the gateway validates, persists, and manages the approval workflow. See [architecture/policy-advisor.md](policy-advisor.md) for the full pipeline design.
-
-| RPC | Description |
-|-----|-------------|
-| `SubmitPolicyAnalysis` | Receives pre-formed `PolicyChunk` proposals from a sandbox. Validates each chunk, persists via upsert on `(sandbox_id, host, port, binary)` dedup key, notifies watch bus. |
-| `GetDraftPolicy` | Returns all draft chunks for a sandbox with current draft version. |
-| `ApproveDraftChunk` | Approves a pending or rejected chunk. Merges the proposed rule into the active policy (appends binary to existing rule or inserts new rule). **Blocked when a global policy is active** -- returns `FailedPrecondition`. |
-| `RejectDraftChunk` | Rejects a pending chunk or revokes an approved chunk. If revoking, removes the binary from the active policy rule. Rejection of `pending` chunks is always allowed. **Revoking approved chunks is blocked when a global policy is active** -- returns `FailedPrecondition`. |
-| `ApproveAllDraftChunks` | Bulk approves all pending chunks for a sandbox. **Blocked when a global policy is active** -- returns `FailedPrecondition`. |
-| `EditDraftChunk` | Updates the proposed rule on a pending chunk. |
-| `GetDraftHistory` | Returns all chunks (including rejected) for audit trail. |
-
-### Inference Service
-
-Defined in `proto/inference.proto`, implemented in `crates/openshell-server/src/inference.rs` as `InferenceService`.
-
-The gateway acts as the control plane for inference configuration. It stores a single managed cluster inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
-
-#### Cluster Inference Configuration
-
-The gateway manages a single cluster-wide inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
-
-| RPC | Description |
-|-----|-------------|
-| `SetClusterInference` | Configures the cluster inference route. Validates `provider_name` and `model_id` are non-empty, verifies the named provider exists and has a supported type for inference (openai, anthropic, nvidia), validates the provider has a usable API key, then upserts the `inference.local` route record. Increments a monotonic `version` on each update. Returns the configured `provider_name`, `model_id`, and `version`. |
-| `GetClusterInference` | Returns the current cluster inference configuration (`provider_name`, `model_id`, `version`). Returns `NotFound` if no cluster inference is configured, or `FailedPrecondition` if the stored route has empty provider/model metadata. |
-| `GetInferenceBundle` | Returns the resolved inference route bundle for sandbox consumption. See [Route Bundle Delivery](#route-bundle-delivery) below. |
-
-#### Route Bundle Delivery
-
-The `GetInferenceBundle` RPC resolves the managed cluster route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
-
-The trait method delegates to `resolve_inference_bundle(store)` (`crates/openshell-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
-
-The `GetInferenceBundleResponse` includes:
-
-- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. Currently contains zero or one routes (the managed cluster route).
-- **`revision`** -- a hex-encoded hash computed from route contents. Sandboxes compare this value to detect when their route set has changed.
-- **`generated_at_ms`** -- epoch milliseconds when the bundle was assembled.
-
-#### Provider-Based Route Resolution
-
-Managed route resolution in `resolve_managed_cluster_route()` (`crates/openshell-server/src/inference.rs`):
-
-1. Load the managed route by name (`inference.local`).
-2. Skip (return `None`) if the route does not exist, has no spec, or is disabled.
-3. Validate that `provider_name` and `model_id` are non-empty.
-4. Fetch the referenced provider record from the store.
-5. Resolve the provider into a `ResolvedProviderRoute` via `resolve_provider_route()`:
-   - Look up the `InferenceProviderProfile` for the provider's type via `openshell_core::inference::profile_for()`. Supported types: `openai`, `anthropic`, `nvidia`.
-   - Search the provider's credentials map for an API key using the profile's preferred key name (e.g., `OPENAI_API_KEY`), falling back to the first non-empty credential in sorted key order.
-   - Resolve the base URL from the provider's config map using the profile-specific key (e.g., `OPENAI_BASE_URL`), falling back to the profile's default URL.
-   - Derive protocols from the profile (e.g., `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` for OpenAI-compatible providers).
-6. Return a `ResolvedRoute` with the fully materialized endpoint, credentials, and protocols.
-
-The `ClusterInferenceConfig` stored in the database contains only `provider_name` and `model_id`. All other fields (endpoint, credentials, protocols, auth style) are resolved from the provider record at bundle generation time via `build_cluster_inference_config()`.
-
-## HTTP Endpoints
-
-The HTTP router (`crates/openshell-server/src/http.rs`) merges two sub-routers:
-
-### Health Endpoints
-
-| Path | Method | Response |
-|------|--------|----------|
-| `/health` | GET | `200 OK` (empty body) |
-| `/healthz` | GET | `200 OK` (empty body) -- Kubernetes liveness probe |
-| `/readyz` | GET | `200 OK` with JSON `{"status": "healthy", "version": "<version>"}` -- Kubernetes readiness probe |
-
-### SSH Tunnel Endpoint
-
-| Path | Method | Response |
-|------|--------|----------|
-| `/connect/ssh` | CONNECT | Upgrades the connection to a bidirectional TCP tunnel to a sandbox pod's SSH port |
-
-See [SSH Tunnel Gateway](#ssh-tunnel-gateway) for details.
-
-### Cloudflare Endpoints
-
-| Path | Method | Response |
-|------|--------|----------|
-| `/auth/connect` | GET | Browser login relay page that reads `CF_Authorization` and POSTs it back to the CLI localhost callback |
-| `/_ws_tunnel` | GET upgrade | WebSocket tunnel that bridges bytes directly into `MultiplexedService` over an in-memory duplex stream |
-
-## Watch Sandbox Stream
-
-The `WatchSandbox` RPC (`crates/openshell-server/src/grpc.rs`) provides a multiplexed server-streaming response that can include sandbox status snapshots, gateway log lines, and platform events.
-
-### Request Options
-
-The `WatchSandboxRequest` controls what the stream includes:
-
-- `follow_status` -- subscribe to `SandboxWatchBus` notifications and re-read the sandbox record on each change.
-- `follow_logs` -- subscribe to `TracingLogBus` for gateway log lines correlated by `sandbox_id`.
-- `follow_events` -- subscribe to `PlatformEventBus` for Kubernetes events correlated to the sandbox.
-- `log_tail_lines` -- replay the last N log lines before following (default 200).
-- `stop_on_terminal` -- end the stream when the sandbox reaches the `Ready` phase. Note: `Error` phase does not stop the stream because it may be transient (e.g., `ReconcilerError`).
-
-### Stream Protocol
-
-1. Subscribe to all requested buses **before** reading the initial snapshot (prevents missed notifications).
-2. Send the current sandbox record as the first event.
-3. If `stop_on_terminal` is set and the sandbox is already `Ready`, end the stream immediately.
-4. Replay tail logs if `follow_logs` is enabled.
-5. Enter a `tokio::select!` loop listening on up to three broadcast receivers:
-   - **Status updates**: re-read the sandbox from the store, send the snapshot, check for terminal phase.
-   - **Log lines**: forward `SandboxStreamEvent::Log` messages.
-   - **Platform events**: forward `SandboxStreamEvent::Event` messages.
-
-### Event Bus Architecture
-
-```mermaid
-graph LR
-    SW["spawn_sandbox_watcher"]
-    ET["spawn_kube_event_tailer"]
-    TL["SandboxLogLayer<br/>(tracing layer)"]
-
-    WB["SandboxWatchBus<br/>(broadcast per ID)"]
-    LB["TracingLogBus<br/>(broadcast per ID + tail buffer)"]
-    PB["PlatformEventBus<br/>(broadcast per ID)"]
-
-    WS["WatchSandbox stream"]
-
-    SW -->|"notify(id)"| WB
-    TL -->|"publish(id, log_event)"| LB
-    ET -->|"publish(id, platform_event)"| PB
-
-    WB -->|"subscribe(id)"| WS
-    LB -->|"subscribe(id)"| WS
-    PB -->|"subscribe(id)"| WS
-```
-
-All buses use `tokio::sync::broadcast` channels keyed by sandbox ID. Buffer sizes:
-- `SandboxWatchBus`: 128 (signals only, no payload -- just `()`)
-- `TracingLogBus`: 1024 (full `SandboxStreamEvent` payloads)
-- `PlatformEventBus`: 1024 (full `SandboxStreamEvent` payloads)
-
-Broadcast lag is translated to `Status::resource_exhausted` via `broadcast_to_status()`.
-
-**Cleanup:** Each bus exposes a `remove(sandbox_id)` method that drops the broadcast sender (closing active receivers with `RecvError::Closed`) and frees internal map entries. Cleanup is wired into the compute watch reconciler, the periodic orphan sweep for stale `Provisioning` records, and the `delete_sandbox` gRPC handler to prevent unbounded memory growth from accumulated entries for deleted sandboxes.
-
-**Validation:** `WatchSandbox` validates that the sandbox exists before subscribing to any bus, preventing entries from being created for non-existent IDs. `PushSandboxLogs` validates sandbox existence once on the first batch of the stream.
-
-## Remote Exec via SSH
-
-The `ExecSandbox` RPC (`crates/openshell-server/src/grpc.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
-
-### Execution Flow
-
-1. Validate request: `sandbox_id`, `command`, and environment key format (`^[A-Za-z_][A-Za-z0-9_]*$`).
-2. Verify sandbox exists and is in `Ready` phase.
-3. Resolve target: prefer agent pod IP, fall back to Kubernetes service DNS (`<name>.<namespace>.svc.cluster.local`). If the sandbox is not connectable yet (for example the pod exists but has no IP), the gateway returns `FAILED_PRECONDITION` instead of surfacing the condition as an internal server fault.
-4. Build the remote command string: sort environment variables, shell-escape all values, prepend `cd <workdir> &&` if `workdir` is set.
-5. **Start a single-use SSH proxy**: binds an ephemeral local TCP port, accepts one connection, performs the NSSH1 handshake with the sandbox, and bidirectionally copies data.
-6. **Connect via `russh`**: establishes an SSH connection through the local proxy, authenticates with `none` auth as user `sandbox`, opens a session channel, and executes the command.
-7. Stream `ExecSandboxStdout`, `ExecSandboxStderr` chunks as they arrive, then send `ExecSandboxExit` with the exit code.
-8. On timeout (if `timeout_seconds > 0`), send exit code 124 (matching the `timeout(1)` convention).
-
-### NSSH1 Handshake Protocol
-
-The single-use SSH proxy and the SSH tunnel endpoint both use the same handshake:
+The gateway reads its configuration from three sources, merged in this
+precedence (highest first):
 
 ```
-NSSH1 <token> <timestamp> <nonce> <hmac_signature>\n
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
-- `token` -- session token or a one-time UUID.
-- `timestamp` -- Unix epoch seconds.
-- `nonce` -- UUID v4.
-- `hmac_signature` -- `HMAC-SHA256(secret, "{token}|{timestamp}|{nonce}")`, hex-encoded.
-- Expected response: `OK\n` from the sandbox.
+The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
+Driver implementation settings live in the TOML driver tables. See
+`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
+0003 for the full schema.
 
-The `ssh_handshake_skew_secs` configuration controls how much clock skew is tolerated.
+`database_url` is env-only and rejected when present in the file
+(`OPENSHELL_DB_URL` / `--db-url`).
 
-## SSH Tunnel Gateway
+### Driver inheritance
 
-The SSH tunnel endpoint (`crates/openshell-server/src/ssh_tunnel.rs`) allows external SSH clients to reach sandbox pods through the gateway using HTTP CONNECT upgrades.
+`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
+`default_image`,
+`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
+`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
+driver's `[openshell.drivers.<name>]` table when the driver-specific table
+does not override them. The allowlist is per-driver so a gateway-wide
+default cannot land in a driver that does not understand it (e.g.
+`client_tls_secret_name` is K8s-only).
 
-### Request Flow
+`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
+`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
+Podman uses the lowercase enum `always | missing | never | newer`. No
+value means the same thing in both, so the key lives only under each
+driver's own table.
 
-1. Client sends `CONNECT /connect/ssh` with headers `x-sandbox-id` and `x-sandbox-token`.
-2. Handler validates the method is CONNECT, extracts headers.
-3. Fetches the `SshSession` from the store by token; rejects if revoked or if `sandbox_id` does not match.
-4. Fetches the `Sandbox`; rejects if not in `Ready` phase.
-5. Resolves the connect target: agent pod IP if available, otherwise Kubernetes service DNS.
-6. Returns `200 OK`, then upgrades the connection via `hyper::upgrade::on()`.
-7. In a spawned task: connects to the sandbox's SSH port, performs the NSSH1 handshake, then bidirectionally copies bytes between the upgraded HTTP connection and the sandbox TCP stream.
-8. On completion, gracefully shuts down the write-half of the upgraded connection for clean EOF handling.
+Driver-specific values that are not part of the inheritance allowlist
+(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
+table.
 
-## Persistence Layer
+### Package-managed gateway registry
 
-### Store Architecture
+The CLI reads its active-gateway and per-gateway metadata from
+`$XDG_CONFIG_HOME/openshell/`. It also looks for a package-manager owned
+system config root at `/etc/openshell`, using the same layout as the per-user
+config root: `active_gateway` plus `gateways/<name>/metadata.json`. Packages
+or runtimes that need a different location can override that root with a
+non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR`; empty or relative values
+fall back to `/etc/openshell` and emit a warning. The CLI falls back to this
+system config when no per-user `metadata.json` exists; malformed user metadata
+still shadows the system entry, but stray empty directories do not.
 
-The `Store` enum (`crates/openshell-server/src/persistence/mod.rs`) dispatches to either `SqliteStore` or `PostgresStore` based on the database URL prefix:
+System entries are read-only from the CLI, so `gateway remove` rejects a pure
+system entry instead of pretending to delete package-manager owned state.
 
-- `sqlite:*` -- uses `sqlx::SqlitePool` (1 connection for in-memory, 5 for file-based).
-- `postgres://` or `postgresql://` -- uses `sqlx::PgPool` (max 10 connections).
+## Operational Constraints
 
-Both backends auto-run migrations on connect from `crates/openshell-server/migrations/{sqlite,postgres}/`.
-
-### Schema
-
-A single `objects` table stores all object types:
-
-```sql
-CREATE TABLE objects (
-    object_type TEXT NOT NULL,
-    id          TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    payload     BLOB NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (id),
-    UNIQUE (object_type, name)
-);
-```
-
-Objects are identified by `(object_type, id)` with a unique constraint on `(object_type, name)`. The `payload` column stores protobuf-encoded bytes.
-
-### Object Types
-
-| Object type string | Proto message / format | Traits implemented | Notes |
-|--------------------|------------------------|-------------------|-------|
-| `"sandbox"` | `Sandbox` | `ObjectType`, `ObjectId`, `ObjectName` | |
-| `"provider"` | `Provider` | `ObjectType`, `ObjectId`, `ObjectName` | |
-| `"ssh_session"` | `SshSession` | `ObjectType`, `ObjectId`, `ObjectName` | |
-| `"inference_route"` | `InferenceRoute` | `ObjectType`, `ObjectId`, `ObjectName` | |
-| `"gateway_settings"` | JSON `StoredSettings` | Generic `put`/`get` | Singleton, id=`"global"`. Contains the reserved `policy` key for global policy delivery. |
-| `"sandbox_settings"` | JSON `StoredSettings` | Generic `put`/`get` | Per-sandbox, id=`"settings:{sandbox_uuid}"` |
-
-The `sandbox_policies` table stores versioned policy revisions for both sandbox-scoped and global policies. Global revisions use the sentinel `sandbox_id = "__global__"`. See [Gateway Settings Channel](gateway-settings.md#storage-model) for schema details.
-
-### Generic Protobuf Codec
-
-The `Store` provides typed helpers that leverage trait bounds:
-
-- `put_message<T: Message + ObjectType + ObjectId + ObjectName>(&self, msg: &T)` -- encodes to protobuf bytes and upserts.
-- `get_message<T: Message + Default + ObjectType>(&self, id: &str)` -- fetches by ID, decodes protobuf.
-- `get_message_by_name<T: Message + Default + ObjectType>(&self, name: &str)` -- fetches by name, decodes protobuf.
-
-The `generate_name()` function produces random 6-character lowercase alphabetic strings for auto-naming objects.
-
-### Deployment Storage
-
-The gateway runs as a Kubernetes **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/var/openshell`. On k3s clusters this uses the built-in `local-path-provisioner` StorageClass (the cluster default). The SQLite database file at `/var/openshell/openshell.db` survives pod restarts and rescheduling.
-
-The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`.
-
-### CRUD Semantics
-
-- **Put**: Performs an upsert (`INSERT ... ON CONFLICT (id) DO UPDATE ...`). Both `created_at_ms` and `updated_at_ms` are set to the current timestamp in the `VALUES` clause, but the `ON CONFLICT` update only writes `payload` and `updated_at_ms` -- so `created_at_ms` is preserved after the initial insert.
-- **Get / Delete**: Operate by primary key (`id`), filtered by `object_type`.
-- **List**: Pages by `limit` + `offset` with deterministic ordering: `ORDER BY created_at_ms ASC, name ASC`. The secondary sort on `name` prevents unstable ordering when rows share the same millisecond timestamp.
-
-## Kubernetes Integration
-
-### Sandbox CRD Management
-
-`KubernetesComputeDriver` (`crates/openshell-driver-kubernetes/src/driver.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs behind the gateway's compute interface.
-
-- **Get**: `GetSandbox` looks up a sandbox CRD by name and returns a driver-native platform observation (`openshell.compute.v1.DriverSandbox`) with raw status and condition data from the object.
-- **List**: `ListSandboxes` enumerates sandbox CRDs and returns driver-native platform observations for each, sorted by name for stable results.
-- **Create**: Translates an internal `openshell.compute.v1.DriverSandbox` message into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.). When callers do not provide custom `volumeClaimTemplates`, the driver injects a default `workspace` PVC and mounts it at `/sandbox` so the default sandbox home/workdir survives pod rescheduling.
-- **Delete**: Calls the Kubernetes API to delete the CRD by name. Returns `false` if already gone (404).
-- **Stop**: `proto/compute_driver.proto` now reserves `StopSandbox` for a non-destructive lifecycle transition. Resume is intentionally not a dedicated compute-driver RPC; the gateway is expected to auto-resume a stopped sandbox when a client connects or executes into it.
-- **Pod IP resolution**: `agent_pod_ip()` fetches the agent pod and reads `status.podIP`.
-
-### Sandbox Watcher
-
-The Kubernetes driver emits `WatchSandboxes` events through `proto/compute_driver.proto`. `ComputeRuntime` consumes that stream, translates the driver-native snapshots into public `openshell.v1.Sandbox` resources, derives the public phase, and applies the results to the store.
-
-- **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, emits a driver-native snapshot, and lets the gateway translate that into the stored public sandbox record. Notifies the watch bus.
-- **Deleted**: Removes the sandbox record from the store and the index. Notifies the watch bus.
-- **Restarted**: Re-processes all objects (full resync).
-
-### Gateway Phase Derivation
-
-`ComputeRuntime::derive_phase()` (`crates/openshell-server/src/compute/mod.rs`) maps driver-native compute status to the public `SandboxPhase` exposed by `proto/openshell.proto`:
-
-| Condition | Phase |
-|-----------|-------|
-| Driver status `deleting=true` | `Deleting` |
-| Ready condition `status=True` | `Ready` |
-| Ready condition `status=False`, terminal reason | `Error` |
-| Ready condition `status=False`, transient reason | `Provisioning` |
-| No conditions or no status | `Provisioning` (if status exists) / `Unknown` (if no status) |
-
-**Transient reasons** (will retry, stay in `Provisioning`): `ReconcilerError`, `DependenciesNotReady`.
-All other `Ready=False` reasons are treated as terminal failures (`Error` phase).
-
-### Kubernetes Event Tailer
-
-The Kubernetes driver also watches namespace-scoped Kubernetes `Event` objects and correlates them to sandbox IDs before emitting them as compute-driver platform events:
-
-- Events involving `kind: Sandbox` are correlated by sandbox name.
-- Events involving `kind: Pod` are correlated by agent pod name.
-- Other event kinds are ignored.
-
-Matched events are published to the `PlatformEventBus` as `SandboxStreamEvent::Event` payloads.
-
-## Sandbox Index
-
-`SandboxIndex` (`crates/openshell-server/src/sandbox_index.rs`) maintains two in-memory maps protected by an `RwLock`:
-
-- `sandbox_name_to_id: HashMap<String, String>`
-- `agent_pod_to_id: HashMap<String, String>`
-
-Updated by the sandbox watcher on every Applied event and by gRPC handlers during sandbox creation. Used by the event tailer to map Kubernetes event objects back to sandbox IDs.
-
-## Error Handling
-
-- **gRPC errors**: All gRPC handlers return `tonic::Status` with appropriate codes:
-  - `InvalidArgument` for missing/malformed fields
-  - `NotFound` for nonexistent objects
-  - `AlreadyExists` for duplicate creation
-  - `FailedPrecondition` for state violations (e.g., exec on non-Ready sandbox, missing provider)
-  - `Internal` for store/decode/Kubernetes failures
-  - `PermissionDenied` for policy violations
-  - `ResourceExhausted` for broadcast lag (missed messages)
-  - `Cancelled` for closed broadcast channels
-
-- **HTTP errors**: The SSH tunnel handler returns HTTP status codes directly (`401`, `404`, `405`, `412`, `500`, `502`).
-
-- **Connection errors**: Logged at `error` level but do not crash the gateway. TLS handshake failures and individual connection errors are caught and logged per-connection.
-
-- **Background task errors**: The sandbox watcher and event tailer log warnings for individual processing failures but continue running. If the watcher stream ends, it logs a warning and the task exits (no automatic restart).
-
-## Cross-References
-
-- [Sandbox Architecture](sandbox.md) -- sandbox-side policy enforcement, proxy, and isolation details
-- [Gateway Settings Channel](gateway-settings.md) -- runtime settings channel, two-tier resolution, CLI/TUI commands
-- [Inference Routing](inference-routing.md) -- end-to-end inference interception flow, sandbox-side proxy logic, and route resolution
-- [Container Management](build-containers.md) -- how sandbox container images are built and configured
-- [Sandbox Connect](sandbox-connect.md) -- client-side SSH connection flow
-- [Providers](sandbox-providers.md) -- provider credential management and injection
+- Gateway TLS and client certificate distribution are deployment concerns owned
+  by the operator or packaging layer.
+- Compute runtimes own the mechanics of starting workloads and injecting
+  callback configuration.
+- Docker-backed local gateways use Docker's `host-gateway` callback alias on
+  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
+  additional bridge-gateway listener because the host can bind that bridge IP.
+- Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
+  aliases by default so stale Podman machine images do not need Podman's
+  `host-gateway` resolver. Linux Podman keeps the resolver unless
+  `host_gateway_ip` is configured.
+- Gateway restarts recover persisted objects from storage, but live relay
+  streams must be re-established by supervisors.
+- User-facing behavior changes must update published docs in `docs/`; this file
+  should only record stable architecture.

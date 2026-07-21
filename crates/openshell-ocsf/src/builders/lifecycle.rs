@@ -31,27 +31,6 @@ impl<'a> AppLifecycleBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
-
-    #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.lifecycle_label().to_string();
         let mut base = BaseEventData::new(
@@ -64,14 +43,8 @@ impl<'a> AppLifecycleBuilder<'a> {
             self.severity,
             self.ctx.metadata(&["container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::ApplicationLifecycle(ApplicationLifecycleEvent {
             base,
@@ -79,6 +52,9 @@ impl<'a> AppLifecycleBuilder<'a> {
         })
     }
 }
+
+impl_activity_setter!(AppLifecycleBuilder);
+impl_builder_setters!(AppLifecycleBuilder);
 
 #[cfg(test)]
 mod tests {

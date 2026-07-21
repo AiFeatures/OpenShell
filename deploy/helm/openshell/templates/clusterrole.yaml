@@ -4,17 +4,18 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "openshell.fullname" . }}-sandbox-runtimeclass
+  name: {{ include "openshell.fullname" . }}-node-reader
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
+  # Validate projected sandbox ServiceAccount tokens during the
+  # IssueSandboxToken bootstrap exchange.
   - apiGroups:
-      - node.k8s.io
+      - authentication.k8s.io
     resources:
-      - runtimeclasses
+      - tokenreviews
     verbs:
-      - get
-      - list
+      - create
   - apiGroups:
       - ""
     resources:
@@ -22,3 +23,11 @@ rules:
     verbs:
       - get
       - list
+      - watch
+  # Read namespace annotations for OpenShift SCC UID/GID range resolution.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get

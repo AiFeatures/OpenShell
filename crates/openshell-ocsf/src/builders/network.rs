@@ -3,13 +3,11 @@
 
 //! Builder for Network Activity [4001] events.
 
-use std::net::IpAddr;
-
 use crate::builders::SandboxContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{NetworkActivityEvent, OcsfEvent};
-use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule, Process};
+use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// Builder for Network Activity [4001] events.
 pub struct NetworkActivityBuilder<'a> {
@@ -58,53 +56,8 @@ impl<'a> NetworkActivityBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
     pub fn activity_name(mut self, name: impl Into<String>) -> Self {
         self.activity_name = Some(name.into());
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn src_endpoint_addr(mut self, ip: IpAddr, port: u16) -> Self {
-        self.src_endpoint = Some(Endpoint::from_ip(ip, port));
-        self
-    }
-    #[must_use]
-    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> Self {
-        self.dst_endpoint = Some(endpoint);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-        self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
     #[must_use]
@@ -115,11 +68,6 @@ impl<'a> NetworkActivityBuilder<'a> {
     #[must_use]
     pub fn observation_point(mut self, id: u8) -> Self {
         self.observation_point_id = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
         self
     }
     #[must_use]
@@ -166,20 +114,14 @@ impl<'a> NetworkActivityBuilder<'a> {
             metadata,
         );
 
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
         }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
         if let Some(unmapped) = self.unmapped {
             base.unmapped = Some(serde_json::Value::Object(unmapped));
         }
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::NetworkActivity(NetworkActivityEvent {
             base,
@@ -197,10 +139,19 @@ impl<'a> NetworkActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(NetworkActivityBuilder);
+impl_action_disposition_setters!(NetworkActivityBuilder);
+impl_actor_process_setter!(NetworkActivityBuilder);
+impl_dst_endpoint_setter!(NetworkActivityBuilder);
+impl_src_endpoint_addr_setter!(NetworkActivityBuilder);
+impl_firewall_rule_setter!(NetworkActivityBuilder);
+impl_builder_setters!(NetworkActivityBuilder);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::test_sandbox_context;
+    use crate::objects::Process;
 
     #[test]
     fn test_network_activity_builder() {

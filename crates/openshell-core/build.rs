@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::path::{Path, PathBuf};
+
+const PROTO_REL: &str = "../../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Git-derived version ---
@@ -17,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Protobuf compilation ---
+    // Re-run when anything under proto/ changes (including newly added .proto files).
+    println!("cargo:rerun-if-changed={PROTO_REL}");
     // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
     // does not bundle the well-known type includes (google/protobuf/struct.proto
     // etc.), so we must use protobuf-src which ships both the binary and the
@@ -28,26 +33,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("PROTOC", protobuf_src::protoc());
     }
 
-    let proto_files = [
-        "../../proto/openshell.proto",
-        "../../proto/datamodel.proto",
-        "../../proto/sandbox.proto",
-        "../../proto/compute_driver.proto",
-        "../../proto/inference.proto",
-        "../../proto/test.proto",
-    ];
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
+    let proto_root = manifest_dir.join(PROTO_REL);
 
-    // Configure tonic-build
-    tonic_build::configure()
+    let mut proto_files = Vec::new();
+    collect_proto_files(&proto_root, &mut proto_files)?;
+    proto_files.sort();
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let descriptor_path = out_dir.join("openshell_descriptor.bin");
+
+    // Configure tonic/prost protobuf code generation.
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&proto_files, &["../../proto"])?;
+        // Emit a binary FileDescriptorSet so the server can enumerate every
+        // RPC at runtime (used by the per-handler auth exhaustiveness test).
+        .file_descriptor_set_path(&descriptor_path)
+        .compile_protos(&proto_files, &[proto_root])?;
 
-    // Tell cargo to rerun if the proto file changes
-    for proto_file in proto_files {
-        println!("cargo:rerun-if-changed={proto_file}");
+    println!(
+        "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",
+        descriptor_path.display()
+    );
+
+    Ok(())
+}
+
+fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_proto_files(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "proto") {
+            out.push(path);
+        }
     }
-
     Ok(())
 }
 
@@ -63,8 +84,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns `None` when git is unavailable or the repo has no matching tags.
 fn git_version() -> Option<String> {
+    // Match numeric release tags only (e.g. `v0.0.29`). The bare glob `v*`
+    // also matches non-release tags like `vm-dev` or `vm-prod`; when one of
+    // those lands on the same commit as a release tag, `git describe` picks
+    // it and the resulting version string collapses to `m-dev` after the
+    // leading `v` is stripped below. Requiring a digit after `v` excludes
+    // those development tags without losing any release tag.
     let output = std::process::Command::new("git")
-        .args(["describe", "--tags", "--long", "--match", "v*"])
+        .args(["describe", "--tags", "--long", "--match", "v[0-9]*"])
         .output()
         .ok()?;
 

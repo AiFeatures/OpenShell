@@ -76,7 +76,7 @@ fi
 rm -rf "$WHEEL_OUTPUT_DIR"
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
-uv run maturin build --release --features bundled-z3 --out "$WHEEL_OUTPUT_DIR"
+uv run maturin build --release --out "$WHEEL_OUTPUT_DIR"
 
 ls -la "$WHEEL_OUTPUT_DIR"/*.whl
 '''
@@ -143,6 +143,8 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+source tasks/scripts/container-engine.sh
+
 sha256_16() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print substr($1, 1, 16)}'
@@ -166,13 +168,13 @@ if [ -z "$CARGO_VERSION" ] && [ -n "${CI:-}" ]; then
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
-RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-stable}
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-1.95.0}
 CACHE_SCOPE_INPUT="v1|python-wheels-macos|base|${LOCK_HASH}|${RUST_SCOPE}"
 CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 mkdir -p target/wheels
 
-docker build \
+ce build \
   -f deploy/docker/Dockerfile.python-wheels-macos \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
@@ -228,6 +230,7 @@ uv run python -m grpc_tools.protoc \
   proto/inference.proto \
   proto/openshell.proto \
   proto/datamodel.proto \
+  proto/options.proto \
   proto/sandbox.proto
 # Fix absolute imports in generated stubs to use package-relative imports
 uv run python - <<'PY'
@@ -235,6 +238,10 @@ from pathlib import Path
 import re
 
 line_rewrites = {
+    "python/openshell/_proto/inference_pb2.py": [
+        (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
+    ],
     "python/openshell/_proto/inference_pb2_grpc.py": [
         (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
     ],
@@ -244,9 +251,11 @@ line_rewrites = {
     ],
     "python/openshell/_proto/openshell_pb2.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/openshell/_proto/datamodel_pb2.py": [
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/openshell/_proto/datamodel_pb2_grpc.py": [

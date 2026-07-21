@@ -3,30 +3,41 @@
 
 //! SSH connection and proxy utilities.
 
-use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
+use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use openshell_core::ObjectId;
 use openshell_core::forward::{
-    find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response, write_forward_pid,
 };
-use openshell_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
+use openshell_core::proto::{
+    CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
+    tcp_forward_init,
+};
 use owo_colors::OwoColorize;
-use rustls::pki_types::ServerName;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process::Command as TokioCommand;
-use tokio_rustls::TlsConnector;
+use tokio::process::{Child, Command as TokioCommand};
+use tokio_stream::wrappers::ReceiverStream;
 
-const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+/// Time budget for the local listener to become reachable after `ssh` starts.
+/// This is a user-visible readiness deadline for both foreground and background
+/// forwards, not a soft cleanup grace period.
+const FORWARD_LISTENER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay between listener/PID probes within the configured timeout.
+const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+/// Per-attempt connect timeout, so one hung probe cannot consume the whole
+/// grace period.
+const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -42,7 +53,7 @@ impl Editor {
         }
     }
 
-    fn remote_target(self, host_alias: &str) -> String {
+    fn remote_target(host_alias: &str) -> String {
         format!("ssh-remote+{host_alias}")
     }
 
@@ -65,6 +76,7 @@ async fn ssh_session_config(
     server: &str,
     name: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -72,6 +84,7 @@ async fn ssh_session_config(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
+            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -81,23 +94,24 @@ async fn ssh_session_config(
 
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox.id,
+            sandbox_id: sandbox.object_id().to_string(),
         })
         .await
         .into_diagnostic()?;
     let session = response.into_inner();
+    validate_ssh_session_response(&session)
+        .map_err(|err| miette::miette!("gateway returned invalid SSH session response: {err}"))?;
 
     let exe = std::env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to resolve OpenShell executable")?;
-    let exe_command = shell_escape(&exe.to_string_lossy());
+    let exe_command = exe.to_string_lossy().into_owned();
 
     // When using Cloudflare bearer auth, the SSH CONNECT must go through the
     // external tunnel endpoint (the cluster URL), not the server's internal
     // scheme/host/port which may be plaintext HTTP on 127.0.0.1.
     let gateway_url = if tls.is_bearer_auth() {
-        let base = server.trim_end_matches('/');
-        format!("{base}{}", session.connect_path)
+        server.trim_end_matches('/').to_string()
     } else {
         // If the server returned a loopback gateway address, override it with the
         // cluster endpoint's host. This handles the case where the server defaults
@@ -106,20 +120,17 @@ async fn ssh_session_config(
         let gateway_port_u16 = session.gateway_port as u16;
         let (gateway_host, gateway_port) =
             resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-        format!(
-            "{}://{}:{}{}",
-            session.gateway_scheme, gateway_host, gateway_port, session.connect_path
-        )
+        format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
     };
     let gateway_name = tls
         .gateway_name()
         .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
-    let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
-        gateway_url,
-        session.sandbox_id,
-        session.token,
-        shell_escape(gateway_name),
+    let proxy_command = build_proxy_command(
+        &exe_command,
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        gateway_name,
     );
 
     Ok(SshSessionConfig {
@@ -131,6 +142,11 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
+    // SSH log level follows the program's verbosity.  main() maps the `-v`
+    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
+    let ssh_log_level =
+        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+
     let mut command = Command::new("ssh");
     command
         .arg("-o")
@@ -142,7 +158,15 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR");
+        .arg(format!("LogLevel={ssh_log_level}"))
+        // Detect a dead relay within ~45s. The relay rides on a TCP connection
+        // that the client has no way to observe silently dropping (gateway
+        // restart, supervisor restart, cluster failover), so fall back to
+        // SSH-level keepalives instead of hanging forever.
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3");
     command
 }
 
@@ -233,8 +257,9 @@ async fn sandbox_connect_with_mode(
     name: &str,
     tls: &TlsOptions,
     replace_process: bool,
+    workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
     command
@@ -256,16 +281,22 @@ async fn sandbox_connect_with_mode(
 }
 
 /// Connect to a sandbox via SSH.
-pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, true).await
+pub async fn sandbox_connect(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    sandbox_connect_with_mode(server, name, tls, true, workspace).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
     server: &str,
     name: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, false).await
+    sandbox_connect_with_mode(server, name, tls, false, workspace).await
 }
 
 pub async fn sandbox_connect_editor(
@@ -274,12 +305,14 @@ pub async fn sandbox_connect_editor(
     name: &str,
     editor: Editor,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     // Verify the sandbox exists before writing SSH config / launching the editor.
     let mut client = grpc_client(server, tls).await?;
     client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
+            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -287,8 +320,8 @@ pub async fn sandbox_connect_editor(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found: {name}"))?;
 
-    let host_alias = host_alias(name);
-    install_ssh_config(gateway, name)?;
+    let host_alias = host_alias(name, workspace);
+    install_ssh_config(gateway, name, workspace)?;
     launch_editor(editor, &host_alias)?;
     eprintln!(
         "{} Opened {} for sandbox {}",
@@ -301,19 +334,19 @@ pub async fn sandbox_connect_editor(
 
 /// Forward a local port to a sandbox via SSH.
 ///
-/// When `background` is `true` the SSH process is forked into the background
-/// (using `-f`) and its PID is written to a state file so it can be managed
-/// later via [`stop_forward`] or [`list_forwards`].
+/// Background mode keeps the spawned `ssh -N` child alive and records that PID
+/// for later management via [`stop_forward`] or [`list_forwards`].
 pub async fn sandbox_forward(
     server: &str,
     name: &str,
-    spec: &openshell_core::forward::ForwardSpec,
+    spec: &ForwardSpec,
     background: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     openshell_core::forward::check_port_available(spec)?;
 
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
     command
@@ -323,56 +356,174 @@ pub async fn sandbox_forward(
         .arg("-L")
         .arg(spec.ssh_forward_arg());
 
-    if background {
-        // SSH -f: fork to background after authentication.
-        command.arg("-f");
-    }
+    command.arg("sandbox");
 
-    command
-        .arg("sandbox")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    if background {
+        command
+            .kill_on_drop(false)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
 
     let port = spec.port;
 
-    let status = if background {
-        command.status().await.into_diagnostic()?
-    } else {
+    if background {
         let mut child = command.spawn().into_diagnostic()?;
-        match tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await {
-            Ok(status) => status.into_diagnostic()?,
-            Err(_) => {
-                eprintln!("{}", foreground_forward_started_message(name, spec));
-                child.wait().await.into_diagnostic()?
-            }
+        let pid = child.id().ok_or_else(|| {
+            miette::miette!("ssh process did not expose a PID for background tracking")
+        })?;
+
+        if let Err(err) = wait_for_forward_start(&mut child, spec)
+            .await
+            .wrap_err("ssh process started but local forward listener was not reachable")
+        {
+            terminate_owned_forward_child(&mut child);
+            return Err(err);
         }
+
+        track_background_forward_or_cleanup(
+            name,
+            port,
+            pid,
+            &session.sandbox_id,
+            &spec.bind_addr,
+            || terminate_owned_forward_child(&mut child),
+        )?;
+        return Ok(());
+    }
+
+    let status = {
+        let mut child = command.spawn().into_diagnostic()?;
+        if let Err(err) = wait_for_forward_start(&mut child, spec).await {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+        eprintln!("{}", foreground_forward_started_message(name, spec));
+        child.wait().await.into_diagnostic()?
     };
 
     if !status.success() {
         return Err(miette::miette!("ssh exited with status {status}"));
     }
 
-    if background {
-        // SSH has forked — find its PID and record it.
-        if let Some(pid) = find_ssh_forward_pid(&session.sandbox_id, port) {
-            write_forward_pid(name, port, pid, &session.sandbox_id, &spec.bind_addr)?;
-        } else {
-            eprintln!(
-                "{} Could not discover backgrounded SSH process; \
-                 forward may be running but is not tracked",
-                "!".yellow(),
-            );
-        }
-    }
-
     Ok(())
 }
 
-fn foreground_forward_started_message(
+/// Wait for the local listener, racing the probe against the `ssh` child
+/// exiting. An early exit (e.g. `ExitOnForwardFailure=yes` tearing down the
+/// session) means forwarding never came up, so it errors instead of waiting
+/// out the grace period.
+async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result<()> {
+    let listener = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT);
+    tokio::pin!(listener);
+    tokio::select! {
+        result = &mut listener => result,
+        status = child.wait() => {
+            let status = status.into_diagnostic()?;
+            if status.success() {
+                Err(miette::miette!(
+                    "ssh exited before local forward listener opened on {}:{}",
+                    forward_probe_host(spec),
+                    spec.port,
+                ))
+            } else {
+                Err(miette::miette!(
+                    "ssh exited with status {status} before local forward listener opened on {}:{}",
+                    forward_probe_host(spec),
+                    spec.port,
+                ))
+            }
+        }
+    }
+}
+
+/// Poll the local endpoint until a connect succeeds or `wait_for` elapses. The
+/// last probe error is folded into the timeout diagnostic, so a failure reports
+/// why the listener never opened, not just that it timed out.
+async fn wait_for_forward_listener(spec: &ForwardSpec, wait_for: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + wait_for;
+    loop {
+        let probe_error = match probe_forward_listener(spec).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "local forward listener did not open on {}:{} within {}ms: last probe failed with {probe_error}",
+                forward_probe_host(spec),
+                spec.port,
+                wait_for.as_millis(),
+            ));
+        }
+
+        tokio::time::sleep(FORWARD_LISTENER_PROBE_INTERVAL).await;
+    }
+}
+
+/// One bounded TCP connect to the forward endpoint. Returns a `String` error
+/// rather than a `miette` diagnostic to stay cheap in the poll loop. The
+/// connection only proves reachability and is dropped at once; SSH forwards
+/// this throwaway connect to the sandbox-side target.
+async fn probe_forward_listener(spec: &ForwardSpec) -> std::result::Result<(), String> {
+    match tokio::time::timeout(
+        FORWARD_LISTENER_CONNECT_TIMEOUT,
+        TcpStream::connect((forward_probe_host(spec), spec.port)),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "connect timed out after {}ms",
+            FORWARD_LISTENER_CONNECT_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+/// Resolve the bind address to a connectable host. Wildcard binds (`0.0.0.0`,
+/// `::`, empty) are "any-address" listeners, not valid connect targets, so they
+/// map to the matching loopback. Specific addresses are probed as-is.
+fn forward_probe_host(spec: &ForwardSpec) -> &str {
+    match spec.bind_addr.as_str() {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        host => host,
+    }
+}
+
+/// Best-effort cleanup for the SSH child this process spawned.
+fn terminate_owned_forward_child(child: &mut Child) {
+    let _ = child.start_kill();
+}
+
+/// Track a verified background forward, cleaning it up if PID-file persistence fails.
+fn track_background_forward_or_cleanup(
     name: &str,
-    spec: &openshell_core::forward::ForwardSpec,
-) -> String {
+    port: u16,
+    pid: u32,
+    sandbox_id: &str,
+    bind_addr: &str,
+    cleanup: impl FnOnce(),
+) -> Result<()> {
+    if let Err(err) = write_forward_pid(name, port, pid, sandbox_id, bind_addr) {
+        cleanup();
+        return Err(err)
+            .wrap_err("local forward listener was reachable but tracking the SSH process failed");
+    }
+    Ok(())
+}
+
+fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String {
     format!(
         "{} Forwarding port {} to sandbox {name}\n  Access at: {}\n  Press Ctrl+C to stop\n  {}",
         "✓".green().bold(),
@@ -389,12 +540,13 @@ async fn sandbox_exec_with_mode(
     tty: bool,
     tls: &TlsOptions,
     replace_process: bool,
+    workspace: &str,
 ) -> Result<()> {
     if command.is_empty() {
         return Err(miette::miette!("no command provided"));
     }
 
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
     let mut ssh = ssh_base_command(&session.proxy_command);
 
     if tty {
@@ -433,8 +585,9 @@ pub async fn sandbox_exec(
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_exec_with_mode(server, name, command, tty, tls, true).await
+    sandbox_exec_with_mode(server, name, command, tty, tls, true, workspace).await
 }
 
 pub(crate) async fn sandbox_exec_without_exec(
@@ -443,8 +596,9 @@ pub(crate) async fn sandbox_exec_without_exec(
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_exec_with_mode(server, name, command, tty, tls, false).await
+    sandbox_exec_with_mode(server, name, command, tty, tls, false, workspace).await
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
@@ -459,7 +613,147 @@ enum UploadSource {
     FileList {
         base_dir: PathBuf,
         files: Vec<String>,
+        archive_prefix: Option<PathBuf>,
     },
+}
+
+fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()> {
+    let mut archive = tar::Builder::new(writer);
+    match source {
+        UploadSource::SinglePath {
+            local_path,
+            tar_name,
+        } => {
+            append_upload_path(&mut archive, &local_path, Path::new(&tar_name), false)?;
+        }
+        UploadSource::FileList {
+            base_dir,
+            files,
+            archive_prefix,
+        } => {
+            for file in &files {
+                let full_path = base_dir.join(file);
+                let archive_path = archive_prefix
+                    .as_ref()
+                    .map_or_else(|| PathBuf::from(file), |prefix| prefix.join(file));
+                append_upload_path(&mut archive, &full_path, &archive_path, true)?;
+            }
+        }
+    }
+    archive.finish().into_diagnostic()?;
+    Ok(())
+}
+
+fn append_upload_path<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+    skip_missing: bool,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(local_path) {
+        Ok(metadata) => metadata,
+        Err(err) if skip_missing && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to stat {}", local_path.display()));
+        }
+    };
+    let file_type = metadata.file_type();
+
+    if file_type.is_file() {
+        archive
+            .append_path_with_name(local_path, archive_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to add {} to tar archive", archive_path.display()))?;
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        let dir_archive_path = upload_archive_dir_entry_path(archive_path);
+        archive
+            .append_dir(&dir_archive_path, local_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to add directory {} to tar archive",
+                    archive_path.display()
+                )
+            })?;
+        append_upload_dir_contents(archive, local_path, archive_path)?;
+        return Ok(());
+    }
+
+    if file_type.is_symlink() {
+        append_upload_symlink(archive, local_path, archive_path, &metadata)?;
+        return Ok(());
+    }
+
+    Err(miette::miette!(
+        "unsupported file type for upload: {}",
+        local_path.display()
+    ))
+}
+
+fn upload_archive_dir_entry_path(archive_path: &Path) -> PathBuf {
+    let mut path = archive_path.as_os_str().to_os_string();
+    path.push("/");
+    PathBuf::from(path)
+}
+
+fn append_upload_dir_contents<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+) -> Result<()> {
+    let mut entries = fs::read_dir(local_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let child_local_path = entry.path();
+        let child_archive_path = archive_path.join(entry.file_name());
+        append_upload_path(archive, &child_local_path, &child_archive_path, false)?;
+    }
+
+    Ok(())
+}
+
+fn append_upload_symlink<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    let target = fs::read_link(local_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read symlink {}", local_path.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(metadata);
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_cksum();
+    archive
+        .append_link(&mut header, archive_path, target)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to add symlink {} to tar archive",
+                archive_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn local_upload_path_is_file_like(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
 }
 
 /// Core tar-over-SSH upload: streams a tar archive into `dest_dir` on the
@@ -475,15 +769,13 @@ async fn ssh_tar_upload(
     dest_dir: Option<&str>,
     source: UploadSource,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     // When no explicit destination is given, use the unescaped `$HOME` shell
     // variable so the remote shell resolves it at runtime.
-    let escaped_dest = match dest_dir {
-        Some(d) => shell_escape(d),
-        None => "$HOME".to_string(),
-    };
+    let escaped_dest = dest_dir.map_or_else(|| "$HOME".to_string(), shell_escape);
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
@@ -504,50 +796,9 @@ async fn ssh_tar_upload(
         .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
 
     // Build the tar archive in a blocking task since the tar crate is synchronous.
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut archive = tar::Builder::new(stdin);
-        match source {
-            UploadSource::SinglePath {
-                local_path,
-                tar_name,
-            } => {
-                if local_path.is_file() {
-                    archive
-                        .append_path_with_name(&local_path, &tar_name)
-                        .into_diagnostic()?;
-                } else if local_path.is_dir() {
-                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
-                } else {
-                    return Err(miette::miette!(
-                        "local path does not exist: {}",
-                        local_path.display()
-                    ));
-                }
-            }
-            UploadSource::FileList { base_dir, files } => {
-                for file in &files {
-                    let full_path = base_dir.join(file);
-                    if full_path.is_file() {
-                        archive
-                            .append_path_with_name(&full_path, file)
-                            .into_diagnostic()
-                            .wrap_err_with(|| format!("failed to add {file} to tar archive"))?;
-                    } else if full_path.is_dir() {
-                        archive
-                            .append_dir_all(file, &full_path)
-                            .into_diagnostic()
-                            .wrap_err_with(|| {
-                                format!("failed to add directory {file} to tar archive")
-                            })?;
-                    }
-                }
-            }
-        }
-        archive.finish().into_diagnostic()?;
-        Ok(())
-    })
-    .await
-    .into_diagnostic()??;
+    tokio::task::spawn_blocking(move || -> Result<()> { write_upload_archive(stdin, source) })
+        .await
+        .into_diagnostic()??;
 
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
@@ -563,7 +814,7 @@ async fn ssh_tar_upload(
     Ok(())
 }
 
-/// Split a sandbox path into (parent_directory, basename).
+/// Split a sandbox path into (`parent_directory`, basename).
 ///
 /// Examples:
 ///   `"/sandbox/.bashrc"`  -> `("/sandbox", ".bashrc")`
@@ -577,18 +828,144 @@ fn split_sandbox_path(path: &str) -> (&str, &str) {
     }
 }
 
+/// Writable root inside every sandbox. Used as the boundary for path-traversal
+/// checks on sandbox-side source paths in download flows.
+const SANDBOX_WORKSPACE_ROOT: &str = "/sandbox";
+
+/// Lexically clean a POSIX-style absolute path by resolving `.` and `..`
+/// components, collapsing repeated separators, and stripping any trailing
+/// slash. Returns `None` if the input is empty or relative — the caller is
+/// expected to reject those before reaching this helper.
+///
+/// This is *lexical* only: it does not consult the filesystem and so cannot
+/// follow symlinks. That trade-off is intentional — the function is used
+/// client-side to refuse obvious path-traversal attempts before issuing the
+/// SSH command. Symlink-based escapes inside the sandbox must be addressed
+/// server-side.
+fn lexical_clean_absolute_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    if stack.is_empty() {
+        return Some("/".to_string());
+    }
+    let mut out = String::with_capacity(path.len());
+    for component in stack {
+        out.push('/');
+        out.push_str(component);
+    }
+    Some(out)
+}
+
+/// Validate that a sandbox-side source path passed to `sandbox download`
+/// resolves under the sandbox writable root.
+///
+/// Returns the cleaned, traversal-resolved path on success. Refuses any
+/// path that lexically escapes `/sandbox` (e.g. `/etc/passwd`,
+/// `/sandbox/../etc/passwd`) with a user-facing error.
+///
+/// This is a lexical guard only — it does not follow symlinks. Call
+/// `resolve_sandbox_source_path` after this on any path that will be passed
+/// to a subsequent SSH I/O operation, so a symlink such as
+/// `/sandbox/etc-link -> /etc` cannot leak files outside the workspace.
+fn validate_sandbox_source_path(path: &str) -> Result<String> {
+    if path.is_empty() {
+        return Err(miette::miette!("sandbox source path is empty"));
+    }
+    let cleaned = lexical_clean_absolute_path(path)
+        .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
+    if !is_under_sandbox_workspace(&cleaned) {
+        return Err(miette::miette!(
+            "sandbox source path '{path}' is outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+        ));
+    }
+    Ok(cleaned)
+}
+
+/// Pure helper: is `path` equal to `/sandbox` or a descendant of it?
+fn is_under_sandbox_workspace(path: &str) -> bool {
+    path == SANDBOX_WORKSPACE_ROOT || path.starts_with(&format!("{SANDBOX_WORKSPACE_ROOT}/"))
+}
+
+/// Resolve every symlink in `sandbox_path` on the sandbox side and refuse the
+/// result if it lands outside `/sandbox`.
+///
+/// The lexical guard in `validate_sandbox_source_path` cannot see symlinks; a
+/// path such as `/sandbox/etc-link/passwd` (where `etc-link -> /etc`) clears
+/// the lexical check but would still leak `/etc/passwd` once `tar -C` follows
+/// the link. Resolving symlinks on the remote side and re-validating closes
+/// that gap. The returned fully-resolved path is what the caller should hand
+/// to probe and tar invocations.
+async fn resolve_sandbox_source_path(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+) -> Result<String> {
+    let resolve_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
+    let resolved = ssh_run_capture_stdout(session, &resolve_cmd)
+        .await
+        .wrap_err_with(|| format!("failed to resolve sandbox source path '{sandbox_path}'"))?;
+    if resolved.is_empty() {
+        return Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' does not exist"
+        ));
+    }
+    if !is_under_sandbox_workspace(&resolved) {
+        return Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Resolve the host-side target path for a downloaded *file*, following
+/// `cp`-style semantics.
+///
+/// - If `dest_str` ends with `/` or already exists as a directory, the file is
+///   placed inside it as `<dest>/<source_basename>`.
+/// - Otherwise `dest_str` is treated as the exact file path to write.
+///
+/// `dest_exists_as_dir` is taken as a parameter (rather than queried inside)
+/// so this function stays pure and unit-testable; the caller performs the
+/// filesystem check.
+fn resolve_file_download_target(
+    dest_str: &str,
+    source_basename: &str,
+    dest_exists_as_dir: bool,
+) -> PathBuf {
+    let trailing_slash = dest_str.ends_with('/');
+    let dest_path = Path::new(dest_str);
+    if trailing_slash || dest_exists_as_dir {
+        dest_path.join(source_basename)
+    } else {
+        dest_path.to_path_buf()
+    }
+}
+
 /// Push a list of files from a local directory into a sandbox using tar-over-SSH.
 ///
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
 /// the sandbox side.  When `dest` is `None`, files are uploaded to the
 /// sandbox user's home directory.
+#[allow(clippy::too_many_arguments)]
 pub async fn sandbox_sync_up_files(
     server: &str,
     name: &str,
     base_dir: &Path,
     files: &[String],
+    local_path: &Path,
     dest: Option<&str>,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -600,8 +977,10 @@ pub async fn sandbox_sync_up_files(
         UploadSource::FileList {
             base_dir: base_dir.to_path_buf(),
             files: files.to_vec(),
+            archive_prefix: file_list_archive_prefix(local_path),
         },
         tls,
+        workspace,
     )
     .await
 }
@@ -619,6 +998,7 @@ pub async fn sandbox_sync_up(
     local_path: &Path,
     sandbox_path: Option<&str>,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     // When an explicit destination is given and looks like a file path (does
     // not end with '/'), split into parent directory + target basename so that
@@ -629,33 +1009,39 @@ pub async fn sandbox_sync_up(
     // passed "/sandbox"), fall through to directory semantics instead.  The
     // sandbox user cannot write to "/" and the intent is almost certainly
     // "put the file inside /sandbox", not "create a file named sandbox in /".
-    if let Some(path) = sandbox_path {
-        if local_path.is_file() && !path.ends_with('/') {
-            let (parent, target_name) = split_sandbox_path(path);
-            if parent != "/" {
-                return ssh_tar_upload(
-                    server,
-                    name,
-                    Some(parent),
-                    UploadSource::SinglePath {
-                        local_path: local_path.to_path_buf(),
-                        tar_name: target_name.into(),
-                    },
-                    tls,
-                )
-                .await;
-            }
+    let local_path_is_file_like = local_upload_path_is_file_like(local_path);
+    if let Some(path) = sandbox_path
+        && local_path_is_file_like
+        && !path.ends_with('/')
+    {
+        let (parent, target_name) = split_sandbox_path(path);
+        if parent != "/" {
+            return ssh_tar_upload(
+                server,
+                name,
+                Some(parent),
+                UploadSource::SinglePath {
+                    local_path: local_path.to_path_buf(),
+                    tar_name: target_name.into(),
+                },
+                tls,
+                workspace,
+            )
+            .await;
         }
     }
 
-    let tar_name = if local_path.is_file() {
+    let tar_name = if local_path_is_file_like {
         local_path
             .file_name()
             .ok_or_else(|| miette::miette!("path has no file name"))?
             .to_os_string()
     } else {
-        // For directories the tar_name is unused — append_dir_all uses "."
-        ".".into()
+        // For directories, wrap contents under the source basename so uploads
+        // land at `<dest>/<dirname>/...` — matches `scp -r` and `cp -r`. Falls
+        // back to "." for paths with no meaningful basename (`.`, `/`), which
+        // preserves the legacy flatten behavior in those edge cases.
+        directory_upload_prefix(local_path)
     };
 
     ssh_tar_upload(
@@ -667,45 +1053,137 @@ pub async fn sandbox_sync_up(
             tar_name,
         },
         tls,
+        workspace,
     )
     .await
 }
 
+/// Compute the tar entry prefix for a directory upload.
+///
+/// Returns the directory's basename for any path with a meaningful basename;
+/// callers extracting at `<dest>` will see contents wrapped under
+/// `<dest>/<basename>/...`. Returns `"."` for paths without a basename
+/// (e.g. `.` or `/`), which produces flat extraction at `<dest>`.
+fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
+    local_path
+        .file_name()
+        .map_or_else(|| ".".into(), std::ffi::OsStr::to_os_string)
+}
+
+fn file_list_archive_prefix(local_path: &Path) -> Option<PathBuf> {
+    if !local_path.is_dir() {
+        return None;
+    }
+
+    let prefix = directory_upload_prefix(local_path);
+    if prefix == "." {
+        None
+    } else {
+        Some(PathBuf::from(prefix))
+    }
+}
+
+/// Run a small command on the sandbox over SSH and capture its stdout.
+///
+/// Used by the download flow to probe whether the source path is a regular
+/// file or a directory before streaming the tar archive. Stderr is inherited
+/// so the user still sees any diagnostic output from ssh itself.
+async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Result<String> {
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let output = tokio::task::spawn_blocking(move || ssh.output())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+    if !output.status.success() {
+        return Err(miette::miette!(
+            "ssh probe exited with status {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxSourceKind {
+    File,
+    Directory,
+}
+
+/// Probe the sandbox-side source path. The path is assumed to have already
+/// been validated by `validate_sandbox_source_path`.
+async fn probe_sandbox_source_kind(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+) -> Result<SandboxSourceKind> {
+    let probe_cmd = format!(
+        "if [ -d {path} ]; then printf dir; elif [ -e {path} ]; then printf file; else printf missing; fi",
+        path = shell_escape(sandbox_path),
+    );
+    let kind = ssh_run_capture_stdout(session, &probe_cmd).await?;
+    match kind.as_str() {
+        "dir" => Ok(SandboxSourceKind::Directory),
+        "file" => Ok(SandboxSourceKind::File),
+        "missing" => Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' does not exist"
+        )),
+        other => Err(miette::miette!(
+            "unexpected probe output for sandbox source path '{sandbox_path}': '{other}'"
+        )),
+    }
+}
+
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
+///
+/// Follows `cp`-style semantics for the destination:
+///
+/// - If the source is a single file:
+///   - When `dest` ends with `/` or already exists as a directory on the host,
+///     the file lands at `<dest>/<source-basename>`.
+///   - Otherwise `dest` is taken to be the exact file path to write.
+/// - If the source is a directory, its contents are extracted into `dest`
+///   (creating `dest` if it does not yet exist). This preserves prior
+///   behaviour for the directory-source case.
+///
+/// The sandbox source path is also subjected to a workspace-boundary check
+/// before any SSH command is issued; paths that lexically resolve outside
+/// `/sandbox` are refused.
 pub async fn sandbox_sync_down(
     server: &str,
     name: &str,
     sandbox_path: &str,
-    local_path: &Path,
+    dest: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+    let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
+    let sandbox_path = resolve_sandbox_source_path(&session, &sandbox_path).await?;
+    let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
-    // Build tar command.  When the sandbox path is a directory we tar its
-    // *contents* (using `-C <path> .`) so the caller gets the files directly
-    // without an extra wrapper directory.  For a single file we split into
-    // the parent directory and the filename.
-    let sandbox_path_clean = sandbox_path.trim_end_matches('/');
+    match kind {
+        SandboxSourceKind::File => sandbox_sync_down_file(&session, &sandbox_path, dest).await,
+        SandboxSourceKind::Directory => {
+            sandbox_sync_down_directory(&session, &sandbox_path, dest).await
+        }
+    }
+}
 
-    let tar_cmd = format!(
-        "if [ -d {path} ]; then tar cf - -C {path} .; else tar cf - -C {parent} {name}; fi",
-        path = shell_escape(sandbox_path_clean),
-        parent = shell_escape(
-            sandbox_path_clean
-                .rfind('/')
-                .map_or(".", |pos| if pos == 0 {
-                    "/"
-                } else {
-                    &sandbox_path_clean[..pos]
-                })
-        ),
-        name = shell_escape(
-            sandbox_path_clean
-                .rfind('/')
-                .map_or(sandbox_path_clean, |pos| &sandbox_path_clean[pos + 1..])
-        ),
-    );
-
+/// Stream a tar archive from the sandbox and extract it into a fresh
+/// destination directory. The source is always wrapped on the sandbox side so
+/// the host can pick a basename when needed.
+async fn stream_sandbox_tar(
+    session: &SshSessionConfig,
+    tar_cmd: String,
+    extract_into: &Path,
+) -> Result<()> {
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
         .arg("-o")
@@ -722,14 +1200,11 @@ pub async fn sandbox_sync_down(
         .take()
         .ok_or_else(|| miette::miette!("failed to open stdout for ssh process"))?;
 
-    let local_path = local_path.to_path_buf();
+    let extract_into = extract_into.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        fs::create_dir_all(&local_path)
-            .into_diagnostic()
-            .wrap_err("failed to create local destination directory")?;
         let mut archive = tar::Archive::new(stdout);
         archive
-            .unpack(&local_path)
+            .unpack(&extract_into)
             .into_diagnostic()
             .wrap_err("failed to extract tar archive from sandbox")?;
         Ok(())
@@ -747,8 +1222,123 @@ pub async fn sandbox_sync_down(
             "ssh tar create exited with status {status}"
         ));
     }
-
     Ok(())
+}
+
+/// Build the `tar cf - -C <parent> -- <basename>` command used to wrap a
+/// single sandbox-side file for download.
+///
+/// The trailing `--` is required: a sandbox-side file whose basename starts
+/// with `-` (e.g. `--checkpoint-action=...`) would otherwise be parsed by GNU
+/// tar as an option rather than a member to archive.
+fn build_single_file_tar_cmd(parent: &str, basename: &str) -> String {
+    format!(
+        "tar cf - -C {parent} -- {name}",
+        parent = shell_escape(parent),
+        name = shell_escape(basename),
+    )
+}
+
+async fn sandbox_sync_down_file(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+    dest: &str,
+) -> Result<()> {
+    let (parent, basename) = split_sandbox_path(sandbox_path);
+    let dest_exists_as_dir = fs::symlink_metadata(Path::new(dest)).is_ok_and(|m| m.is_dir());
+    let final_path = resolve_file_download_target(dest, basename, dest_exists_as_dir);
+
+    let staging_parent = final_path
+        .parent()
+        .ok_or_else(|| miette::miette!("destination '{}' has no parent directory", dest))?;
+    fs::create_dir_all(staging_parent)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create local destination directory '{}'",
+                staging_parent.display()
+            )
+        })?;
+
+    let staging = tempfile::TempDir::new_in(staging_parent)
+        .into_diagnostic()
+        .wrap_err("failed to create download staging directory")?;
+
+    let tar_cmd = build_single_file_tar_cmd(parent, basename);
+    stream_sandbox_tar(session, tar_cmd, staging.path()).await?;
+
+    place_downloaded_file(staging.path(), basename, &final_path).wrap_err_with(|| {
+        format!(
+            "failed to place downloaded file at '{}'",
+            final_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Move a single file extracted by `stream_sandbox_tar` into its final
+/// position on the host.
+///
+/// `staging_dir` must contain a single regular-file entry named
+/// `source_basename` (the wrapper produced by `tar cf - -C <parent> <name>`).
+/// The entry is renamed onto `final_path`, atomically when `staging_dir` is
+/// on the same filesystem. Refuses to overwrite an existing directory at
+/// `final_path` to match `cp` behaviour.
+fn place_downloaded_file(
+    staging_dir: &Path,
+    source_basename: &str,
+    final_path: &Path,
+) -> Result<()> {
+    let staged_file = staging_dir.join(source_basename);
+    let staged_meta = fs::symlink_metadata(&staged_file)
+        .into_diagnostic()
+        .wrap_err("downloaded archive did not contain the expected entry")?;
+    if !staged_meta.is_file() {
+        return Err(miette::miette!(
+            "downloaded entry '{source_basename}' is not a regular file"
+        ));
+    }
+
+    if let Ok(existing) = fs::symlink_metadata(final_path)
+        && existing.is_dir()
+    {
+        return Err(miette::miette!(
+            "cannot overwrite directory '{}' with downloaded file",
+            final_path.display()
+        ));
+    }
+
+    fs::rename(&staged_file, final_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to rename into '{}'", final_path.display()))?;
+    Ok(())
+}
+
+async fn sandbox_sync_down_directory(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+    dest: &str,
+) -> Result<()> {
+    let dest_path = Path::new(dest);
+    if let Ok(existing) = fs::symlink_metadata(dest_path)
+        && !existing.is_dir()
+    {
+        return Err(miette::miette!(
+            "cannot extract directory '{sandbox_path}' over non-directory destination '{}'",
+            dest_path.display()
+        ));
+    }
+    fs::create_dir_all(dest_path)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create local destination directory '{}'",
+                dest_path.display()
+            )
+        })?;
+
+    let tar_cmd = format!("tar cf - -C {path} .", path = shell_escape(sandbox_path));
+    stream_sandbox_tar(session, tar_cmd, dest_path).await
 }
 
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
@@ -758,11 +1348,82 @@ pub async fn sandbox_ssh_proxy(
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let server = grpc_server_from_ssh_gateway_url(gateway_url)?;
+    let mut client = grpc_client(&server, tls).await?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    tx.send(TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            TcpForwardInit {
+                sandbox_id: sandbox_id.to_string(),
+                service_id: format!("ssh-proxy:{sandbox_id}"),
+                target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
+                authorization_token: token.to_string(),
+            },
+        )),
+    })
+    .await
+    .map_err(|_| miette::miette!("failed to initialize SSH forward stream"))?;
+
+    let mut response = client
+        .forward_tcp(ReceiverStream::new(rx))
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let to_remote = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = stdin.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if tx
+                .send(TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let from_remote = tokio::spawn(async move {
+        let mut stdout = stdout;
+        loop {
+            let Ok(Some(frame)) = response.message().await else {
+                break;
+            };
+            let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+            else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            if stdout.write_all(&data).await.is_err() {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
+    let _ = from_remote.await;
+    to_remote.abort();
+
+    Ok(())
+}
+
+fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {
     let url: url::Url = gateway_url
         .parse()
         .into_diagnostic()
         .wrap_err("invalid gateway URL")?;
-
     let scheme = url.scheme();
     let gateway_host = url
         .host_str()
@@ -770,76 +1431,7 @@ pub async fn sandbox_ssh_proxy(
     let gateway_port = url
         .port_or_known_default()
         .ok_or_else(|| miette::miette!("gateway URL missing port"))?;
-    let connect_path = url.path();
-
-    let request = format!(
-        "CONNECT {connect_path} HTTP/1.1\r\nHost: {gateway_host}\r\nX-Sandbox-Id: {sandbox_id}\r\nX-Sandbox-Token: {token}\r\n\r\n"
-    );
-
-    // The gateway returns 412 (Precondition Failed) when the sandbox pod
-    // exists but hasn't reached Ready phase yet. This is a transient state
-    // after sandbox allocation — retry with backoff instead of failing
-    // immediately.
-    const MAX_CONNECT_WAIT: Duration = Duration::from_secs(60);
-    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-    let start = std::time::Instant::now();
-    let mut backoff = INITIAL_BACKOFF;
-    let mut buf_stream;
-
-    loop {
-        let mut stream: Box<dyn ProxyStream> =
-            connect_gateway(scheme, gateway_host, gateway_port, tls).await?;
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .into_diagnostic()?;
-
-        // Wrap in a BufReader **before** reading the HTTP response.  The gateway
-        // may send the 200 OK response and the first SSH protocol bytes in the
-        // same TCP segment / WebSocket frame.  A plain `read()` would consume
-        // those SSH bytes into our buffer and discard them, causing SSH to see a
-        // truncated protocol banner and exit with code 255.  BufReader ensures
-        // any bytes read past the `\r\n\r\n` header boundary stay buffered and
-        // are returned by subsequent reads during the bidirectional copy phase.
-        buf_stream = BufReader::new(stream);
-        let status = read_connect_status(&mut buf_stream).await?;
-        if status == 200 {
-            break;
-        }
-        if status == 412 && start.elapsed() < MAX_CONNECT_WAIT {
-            tracing::debug!(
-                elapsed = ?start.elapsed(),
-                "sandbox not yet ready (HTTP 412), retrying in {backoff:?}"
-            );
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(8));
-            continue;
-        }
-        return Err(miette::miette!(
-            "gateway CONNECT failed with status {status}"
-        ));
-    }
-
-    let (reader, writer) = tokio::io::split(buf_stream);
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-
-    // Spawn both copy directions as independent tasks.  Using separate spawned
-    // tasks (instead of try_join!/select!) ensures that when one direction
-    // completes or errors, the other continues independently until it also
-    // finishes.  This is critical: when the remote side closes the connection,
-    // we must keep the stdin→gateway copy alive so SSH can finish sending its
-    // protocol-close packets, and vice-versa.
-    let to_remote = tokio::spawn(copy_ignoring_errors(stdin, writer));
-    let from_remote = tokio::spawn(copy_ignoring_errors(reader, stdout));
-    let _ = from_remote.await;
-    // Once the remote→stdout direction is done, SSH has received all the data
-    // it needs.  Drop the stdin→gateway task – SSH will close its pipe when
-    // it's done regardless.
-    to_remote.abort();
-
-    Ok(())
+    Ok(format_gateway_url(scheme, gateway_host, gateway_port))
 }
 
 /// Run the SSH proxy in "name mode": create a session on the fly, then proxy.
@@ -848,8 +1440,13 @@ pub async fn sandbox_ssh_proxy(
 /// and sandbox name instead of pre-created gateway/token credentials.  It is
 /// suitable for use as an SSH `ProxyCommand` in `~/.ssh/config` because it
 /// creates a fresh session on every invocation.
-pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+pub async fn sandbox_ssh_proxy_by_name(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    let session = ssh_session_config(server, name, tls, workspace).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
         &session.sandbox_id,
@@ -859,18 +1456,23 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
     .await
 }
 
-fn host_alias(name: &str) -> String {
-    format!("openshell-{name}")
+fn host_alias(name: &str, workspace: &str) -> String {
+    format!("openshell-{name}.{workspace}")
 }
 
-fn render_ssh_config(gateway: &str, name: &str) -> String {
+fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
-    let host_alias = host_alias(name);
+    let proxy_cmd = format!(
+        "{exe} ssh-proxy --gateway-name {} --name {} --workspace {}",
+        shell_escape(gateway),
+        shell_escape(name),
+        shell_escape(workspace),
+    );
+    let host_alias = host_alias(name, workspace);
     format!(
-        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ProxyCommand {proxy_cmd}\n"
+        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     )
 }
 
@@ -968,8 +1570,7 @@ fn upsert_host_block(contents: &str, alias: &str, block: &str) -> String {
             .enumerate()
             .skip(start + 1)
             .find(|(_, line)| line.trim_start().starts_with("Host "))
-            .map(|(idx, _)| idx)
-            .unwrap_or(lines.len());
+            .map_or(lines.len(), |(idx, _)| idx);
 
         out.extend_from_slice(&lines[..start]);
         if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
@@ -995,7 +1596,7 @@ fn upsert_host_block(contents: &str, alias: &str, block: &str) -> String {
     rendered
 }
 
-pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
+pub fn install_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<PathBuf> {
     let managed_config = openshell_ssh_config_path()?;
     let main_config = user_ssh_config_path()?;
     ensure_openshell_include(&main_config, &managed_config)?;
@@ -1004,8 +1605,8 @@ pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
         openshell_core::paths::create_dir_restricted(parent)?;
     }
 
-    let alias = host_alias(name);
-    let block = render_ssh_config(gateway, name);
+    let alias = host_alias(name, workspace);
+    let block = render_ssh_config(gateway, name, workspace);
     let contents = fs::read_to_string(&managed_config).unwrap_or_default();
     let updated = upsert_host_block(&contents, &alias, &block);
     fs::write(&managed_config, updated)
@@ -1018,7 +1619,7 @@ fn launch_editor(editor: Editor, host_alias: &str) -> Result<()> {
     launch_editor_command(
         editor.binary(),
         editor.label(),
-        &editor.remote_target(host_alias),
+        &Editor::remote_target(host_alias),
     )
 }
 
@@ -1052,100 +1653,9 @@ fn launch_editor_command(binary: &str, label: &str, remote_target: &str) -> Resu
 /// The `ProxyCommand` uses `--gateway-name` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the gateway metadata directory
 /// (`~/.config/openshell/gateways/<name>/mtls/`).
-pub fn print_ssh_config(gateway: &str, name: &str) {
-    print!("{}", render_ssh_config(gateway, name));
+pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
+    print!("{}", render_ssh_config(gateway, name, workspace));
 }
-
-/// Copy all bytes from `reader` to `writer`, flushing on completion.
-/// Errors are intentionally discarded – connection teardown errors are
-/// expected during normal SSH session shutdown.
-async fn copy_ignoring_errors<R, W>(mut reader: R, mut writer: W)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let _ = tokio::io::copy(&mut reader, &mut writer).await;
-    let _ = AsyncWriteExt::flush(&mut writer).await;
-    let _ = AsyncWriteExt::shutdown(&mut writer).await;
-}
-
-async fn connect_gateway(
-    scheme: &str,
-    host: &str,
-    port: u16,
-    tls: &TlsOptions,
-) -> Result<Box<dyn ProxyStream>> {
-    // When using edge bearer auth, route through the WebSocket tunnel proxy
-    // regardless of the origin scheme. The proxy handles edge auth headers
-    // and TLS termination at the edge; the origin may be plaintext HTTP
-    // behind the tunnel.
-    if tls.is_bearer_auth() {
-        let token = tls
-            .edge_token
-            .as_deref()
-            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
-        let gateway_url = format!("https://{host}:{port}");
-        let proxy = crate::edge_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
-        let tcp = TcpStream::connect(proxy.local_addr)
-            .await
-            .into_diagnostic()?;
-        tcp.set_nodelay(true).into_diagnostic()?;
-        return Ok(Box::new(tcp));
-    }
-
-    let tcp = TcpStream::connect((host, port)).await.into_diagnostic()?;
-    tcp.set_nodelay(true).into_diagnostic()?;
-    if scheme.eq_ignore_ascii_case("https") {
-        let materials = require_tls_materials(&format!("https://{host}:{port}"), tls)?;
-        let config = build_rustls_config(&materials)?;
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|_| miette::miette!("invalid server name: {host}"))?;
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .into_diagnostic()?;
-        Ok(Box::new(tls))
-    } else {
-        Ok(Box::new(tcp))
-    }
-}
-
-/// Read exactly the HTTP response status line and headers up to `\r\n\r\n`.
-///
-/// Uses byte-at-a-time reads so that the caller's `BufReader` retains any
-/// bytes that arrived after the header boundary (e.g. the SSH protocol
-/// banner that the gateway may send in the same TCP segment).
-async fn read_connect_status<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u16> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await.into_diagnostic()?;
-        if n == 0 {
-            break;
-        }
-        buf.push(byte[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
-        if buf.len() > 8192 {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let line = text.lines().next().unwrap_or("");
-    let status = line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("0")
-        .parse::<u16>()
-        .unwrap_or(0);
-    Ok(status)
-}
-
-trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 #[cfg(test)]
 mod tests {
@@ -1174,6 +1684,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
         let _guard = TEST_ENV_LOCK
             .lock()
@@ -1192,8 +1703,8 @@ mod tests {
         let user_config = ssh_dir.join("config");
         fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
 
-        let managed_path = install_ssh_config("openshell", "demo").unwrap();
-        install_ssh_config("openshell", "demo").unwrap();
+        let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
+        install_ssh_config("openshell", "demo", "default").unwrap();
 
         let main_contents = fs::read_to_string(&user_config).unwrap();
         assert!(main_contents.contains("Host personal"));
@@ -1204,7 +1715,12 @@ mod tests {
         assert!(include_idx < host_idx);
 
         let managed_contents = fs::read_to_string(&managed_path).unwrap();
-        assert_eq!(managed_contents.matches("Host openshell-demo").count(), 1);
+        assert_eq!(
+            managed_contents
+                .matches("Host openshell-demo.default")
+                .count(),
+            1
+        );
         assert!(managed_contents.contains("ProxyCommand"));
 
         unsafe {
@@ -1217,6 +1733,25 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn render_ssh_config_includes_workspace_in_proxy_command() {
+        let config = render_ssh_config("my-gw", "demo", "beta");
+        assert!(
+            config.contains("Host openshell-demo.beta"),
+            "host alias should be workspace-qualified: {config}"
+        );
+        assert!(
+            config.contains("--workspace beta"),
+            "ProxyCommand should include --workspace: {config}"
+        );
+    }
+
+    #[test]
+    fn host_alias_includes_workspace() {
+        assert_eq!(host_alias("demo", "default"), "openshell-demo.default");
+        assert_eq!(host_alias("demo", "beta"), "openshell-demo.beta");
     }
 
     #[test]
@@ -1233,7 +1768,7 @@ mod tests {
 
     #[test]
     fn foreground_forward_started_message_includes_port_and_stop_hint() {
-        let spec = openshell_core::forward::ForwardSpec::new(8080);
+        let spec = ForwardSpec::new(8080);
         let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 8080 to sandbox demo"));
         assert!(message.contains("Access at: http://127.0.0.1:8080/"));
@@ -1246,10 +1781,132 @@ mod tests {
 
     #[test]
     fn foreground_forward_started_message_custom_bind_addr() {
-        let spec = openshell_core::forward::ForwardSpec::parse("0.0.0.0:3000").unwrap();
+        let spec = ForwardSpec::parse("0.0.0.0:3000").unwrap();
         let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 3000 to sandbox demo"));
         assert!(message.contains("Access at: http://localhost:3000/"));
+    }
+
+    #[test]
+    fn forward_probe_host_uses_connectable_loopback_for_wildcard_binds() {
+        let ipv4 = ForwardSpec::parse("0.0.0.0:3000").unwrap();
+        let ipv6 = ForwardSpec::parse(":::3000").unwrap();
+        let loopback = ForwardSpec::new(3000);
+
+        assert_eq!(forward_probe_host(&ipv4), "127.0.0.1");
+        assert_eq!(forward_probe_host(&ipv6), "::1");
+        assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn wait_for_forward_listener_accepts_ready_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let spec = ForwardSpec::new(port);
+
+        wait_for_forward_listener(&spec, Duration::from_secs(1))
+            .await
+            .unwrap();
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_forward_listener_rejects_missing_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let spec = ForwardSpec::new(port);
+
+        let err = wait_for_forward_listener(&spec, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        let text = format!("{err:?}");
+        assert!(text.contains("local forward listener did not open"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_runs_cleanup_when_pidfile_write_fails() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        // Make forward PID-file writes fail with ENOTDIR after listener readiness.
+        let blocking_file = tmp.path().join("not-a-dir");
+        fs::write(&blocking_file, b"x").unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &blocking_file);
+        }
+
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
+
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "PID-file write failure must surface as an error"
+        );
+        assert!(
+            cleaned_up,
+            "the owned SSH child must be cleaned up when tracking fails so no \
+             reachable-but-untracked forward is left running"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_tracks_pid_without_cleanup_on_success() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
+        let pid_file_exists =
+            openshell_core::forward::forward_pid_path("demo", 8080).is_ok_and(|path| path.exists());
+
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "a writable PID directory must track successfully"
+        );
+        assert!(
+            pid_file_exists,
+            "successful tracking must persist a PID file"
+        );
+        assert!(
+            !cleaned_up,
+            "successful tracking must not terminate the forward process"
+        );
     }
 
     #[test]
@@ -1263,6 +1920,483 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn lexical_clean_resolves_dot_and_dotdot_segments() {
+        assert_eq!(
+            lexical_clean_absolute_path("/sandbox/./a"),
+            Some("/sandbox/a".to_string())
+        );
+        assert_eq!(
+            lexical_clean_absolute_path("/sandbox/sub/../a"),
+            Some("/sandbox/a".to_string())
+        );
+        assert_eq!(
+            lexical_clean_absolute_path("/sandbox/../etc/passwd"),
+            Some("/etc/passwd".to_string())
+        );
+        assert_eq!(
+            lexical_clean_absolute_path("//sandbox///foo//"),
+            Some("/sandbox/foo".to_string())
+        );
+        assert_eq!(lexical_clean_absolute_path("/"), Some("/".to_string()));
+    }
+
+    #[test]
+    fn lexical_clean_refuses_relative_paths() {
+        assert_eq!(lexical_clean_absolute_path(""), None);
+        assert_eq!(lexical_clean_absolute_path("sandbox/a"), None);
+        assert_eq!(lexical_clean_absolute_path("./a"), None);
+    }
+
+    #[test]
+    fn validate_sandbox_source_path_accepts_workspace_paths() {
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/file.txt").unwrap(),
+            "/sandbox/file.txt"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/.agent/workspace/hello.txt").unwrap(),
+            "/sandbox/.agent/workspace/hello.txt"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox").unwrap(),
+            "/sandbox"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/").unwrap(),
+            "/sandbox"
+        );
+        assert_eq!(
+            validate_sandbox_source_path("/sandbox/sub/../file").unwrap(),
+            "/sandbox/file"
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_source_path_rejects_traversal_and_escapes() {
+        let traversal = validate_sandbox_source_path("/etc/passwd").unwrap_err();
+        assert!(
+            format!("{traversal}").contains("outside the sandbox workspace"),
+            "unexpected error: {traversal}"
+        );
+
+        let parent_escape = validate_sandbox_source_path("/sandbox/../etc/passwd").unwrap_err();
+        assert!(
+            format!("{parent_escape}").contains("outside the sandbox workspace"),
+            "unexpected error: {parent_escape}"
+        );
+
+        let prefix_only = validate_sandbox_source_path("/sandboxed/secrets").unwrap_err();
+        assert!(
+            format!("{prefix_only}").contains("outside the sandbox workspace"),
+            "unexpected error: {prefix_only}"
+        );
+
+        let empty = validate_sandbox_source_path("").unwrap_err();
+        assert!(format!("{empty}").contains("empty"));
+
+        let relative = validate_sandbox_source_path("sandbox/file").unwrap_err();
+        assert!(format!("{relative}").contains("must be absolute"));
+    }
+
+    #[test]
+    fn is_under_sandbox_workspace_accepts_root_and_descendants() {
+        assert!(is_under_sandbox_workspace("/sandbox"));
+        assert!(is_under_sandbox_workspace("/sandbox/file"));
+        assert!(is_under_sandbox_workspace("/sandbox/sub/nested"));
+    }
+
+    #[test]
+    fn is_under_sandbox_workspace_rejects_outside_paths_and_prefix_collisions() {
+        assert!(!is_under_sandbox_workspace("/etc/passwd"));
+        assert!(!is_under_sandbox_workspace("/sandboxed/secrets"));
+        assert!(!is_under_sandbox_workspace("/"));
+        assert!(!is_under_sandbox_workspace(""));
+    }
+
+    #[test]
+    fn build_single_file_tar_cmd_inserts_double_dash_before_basename() {
+        // Without `--`, a basename such as `--checkpoint-action=...` would be
+        // parsed by GNU tar as an option. Guard the wire format against this
+        // regression.
+        let cmd = build_single_file_tar_cmd("/sandbox", "--checkpoint-action=exec=id");
+        assert!(
+            cmd.contains(" -- "),
+            "expected `--` separator in tar command, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with(&shell_escape("--checkpoint-action=exec=id")),
+            "expected basename at end of tar command, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_single_file_tar_cmd_escapes_parent_and_basename() {
+        let cmd = build_single_file_tar_cmd("/sandbox/with space", "name with space");
+        assert!(cmd.contains(" -- "), "missing `--` separator: {cmd}");
+        assert!(
+            cmd.contains(&shell_escape("/sandbox/with space")),
+            "parent not shell-escaped: {cmd}"
+        );
+        assert!(
+            cmd.contains(&shell_escape("name with space")),
+            "basename not shell-escaped: {cmd}"
+        );
+    }
+
+    #[test]
+    fn resolve_file_download_target_writes_to_dest_when_not_a_directory() {
+        assert_eq!(
+            resolve_file_download_target("/tmp/out.txt", "hello.txt", false),
+            PathBuf::from("/tmp/out.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_file_download_target_places_inside_existing_directory() {
+        assert_eq!(
+            resolve_file_download_target("/tmp", "hello.txt", true),
+            PathBuf::from("/tmp/hello.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_file_download_target_honors_trailing_slash() {
+        assert_eq!(
+            resolve_file_download_target("/tmp/newdir/", "hello.txt", false),
+            PathBuf::from("/tmp/newdir/hello.txt")
+        );
+    }
+
+    fn build_single_file_archive(entry_path: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(entry_path).expect("set tar entry path");
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, bytes).expect("append tar entry");
+            builder.finish().expect("finish tar archive");
+        }
+        buf
+    }
+
+    fn unpack_into(archive_bytes: &[u8], staging: &Path) {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(archive_bytes));
+        archive.unpack(staging).expect("unpack archive");
+    }
+
+    #[test]
+    fn place_downloaded_file_writes_regular_file_at_dest() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging = workdir.path().join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+        unpack_into(&archive, &staging);
+
+        let dest = workdir.path().join("out.txt");
+        place_downloaded_file(&staging, "hello.txt", &dest).expect("place file");
+
+        let meta = fs::symlink_metadata(&dest).expect("stat dest");
+        assert!(meta.is_file(), "dest must be a regular file, got {meta:?}");
+        assert_eq!(fs::read(&dest).expect("read dest"), b"trust me");
+    }
+
+    #[test]
+    fn place_downloaded_file_refuses_to_clobber_existing_directory() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging = workdir.path().join("staging");
+        fs::create_dir_all(&staging).expect("create staging");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+        unpack_into(&archive, &staging);
+
+        let dest = workdir.path().join("conflict-dir");
+        fs::create_dir(&dest).expect("create conflict dir");
+
+        let err = place_downloaded_file(&staging, "hello.txt", &dest)
+            .expect_err("expected directory-clobber refusal");
+        assert!(
+            format!("{err}").contains("cannot overwrite directory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            fs::symlink_metadata(&dest).expect("stat dest").is_dir(),
+            "dest should remain a directory after refusal"
+        );
+    }
+
+    #[test]
+    fn download_full_pipeline_lands_file_at_exact_dest_path() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let staging_parent = workdir.path();
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+
+        let dest_str = staging_parent.join("out.txt");
+        let dest_str = dest_str.to_str().unwrap();
+        let final_path = resolve_file_download_target(dest_str, "hello.txt", false);
+        assert_eq!(final_path, Path::new(dest_str));
+
+        let staging = tempfile::TempDir::new_in(staging_parent).expect("staging dir");
+        unpack_into(&archive, staging.path());
+        place_downloaded_file(staging.path(), "hello.txt", &final_path).expect("place");
+
+        let meta = fs::symlink_metadata(&final_path).expect("stat final");
+        assert!(meta.is_file(), "expected regular file, got {meta:?}");
+        assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
+    }
+
+    #[test]
+    fn download_full_pipeline_places_inside_existing_directory_destination() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+
+        let dest_dir = workdir.path().join("out-dir");
+        fs::create_dir(&dest_dir).expect("create dest dir");
+        let dest_str = dest_dir.to_str().unwrap();
+        let final_path = resolve_file_download_target(dest_str, "hello.txt", true);
+        assert_eq!(final_path, dest_dir.join("hello.txt"));
+
+        let staging = tempfile::TempDir::new_in(workdir.path()).expect("staging dir");
+        unpack_into(&archive, staging.path());
+        place_downloaded_file(staging.path(), "hello.txt", &final_path).expect("place");
+
+        let meta = fs::symlink_metadata(&final_path).expect("stat final");
+        assert!(meta.is_file());
+        assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
+    }
+
+    #[test]
+    fn directory_upload_prefix_uses_basename_for_named_directories() {
+        assert_eq!(
+            directory_upload_prefix(Path::new("/tmp/upload-test")),
+            std::ffi::OsString::from("upload-test")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("foo")),
+            std::ffi::OsString::from("foo")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("./parent/nested")),
+            std::ffi::OsString::from("nested")
+        );
+    }
+
+    #[test]
+    fn directory_upload_prefix_falls_back_to_dot_for_basename_less_paths() {
+        assert_eq!(
+            directory_upload_prefix(Path::new(".")),
+            std::ffi::OsString::from(".")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("/")),
+            std::ffi::OsString::from(".")
+        );
+    }
+
+    #[test]
+    fn file_list_archive_prefix_uses_named_directory_basename() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        let file = tmpdir.path().join("file.txt");
+        fs::create_dir_all(&source).expect("create source dir");
+        fs::write(&file, "file").expect("write file");
+
+        assert_eq!(
+            file_list_archive_prefix(&source),
+            Some(PathBuf::from("source-dir"))
+        );
+        assert_eq!(file_list_archive_prefix(Path::new(".")), None);
+        assert_eq!(file_list_archive_prefix(&file), None);
+    }
+
+    #[derive(Debug)]
+    struct UploadArchiveEntry {
+        path: String,
+        entry_type: tar::EntryType,
+        link_name: Option<String>,
+    }
+
+    fn upload_archive_entries(source: UploadSource) -> Vec<UploadArchiveEntry> {
+        let mut bytes = Vec::new();
+        write_upload_archive(&mut bytes, source).expect("write upload archive");
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        let entries = archive.entries().expect("read archive entries");
+        let mut entries = entries
+            .map(|entry| {
+                let entry = entry.expect("read archive entry");
+                let path = entry
+                    .path()
+                    .expect("read archive path")
+                    .to_string_lossy()
+                    .into_owned();
+                let entry_type = entry.header().entry_type();
+                let link_name = entry
+                    .link_name()
+                    .expect("read archive link")
+                    .map(|link| link.to_string_lossy().into_owned());
+
+                UploadArchiveEntry {
+                    path,
+                    entry_type,
+                    link_name,
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        entries
+    }
+
+    fn upload_archive_paths(source: UploadSource) -> Vec<String> {
+        let mut paths = upload_archive_entries(source)
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn file_list_archive_preserves_directory_prefix_when_requested() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let base_dir = tmpdir.path().join("nested");
+        fs::create_dir_all(base_dir.join("inner")).expect("create dirs");
+        fs::write(base_dir.join("file.txt"), "file").expect("write file");
+        fs::write(base_dir.join("inner/child.txt"), "child").expect("write child");
+
+        let paths = upload_archive_paths(UploadSource::FileList {
+            base_dir,
+            files: vec!["file.txt".into(), "inner/child.txt".into()],
+            archive_prefix: Some(PathBuf::from("nested")),
+        });
+
+        assert_eq!(paths, vec!["nested/file.txt", "nested/inner/child.txt"]);
+    }
+
+    #[test]
+    fn file_list_archive_stays_flat_without_directory_prefix() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let base_dir = tmpdir.path().join("nested");
+        fs::create_dir_all(base_dir.join("inner")).expect("create dirs");
+        fs::write(base_dir.join("file.txt"), "file").expect("write file");
+        fs::write(base_dir.join("inner/child.txt"), "child").expect("write child");
+
+        let paths = upload_archive_paths(UploadSource::FileList {
+            base_dir,
+            files: vec!["file.txt".into(), "inner/child.txt".into()],
+            archive_prefix: None,
+        });
+
+        assert_eq!(paths, vec!["file.txt", "inner/child.txt"]);
+    }
+
+    #[test]
+    fn single_directory_archive_preserves_directory_basename() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        fs::create_dir_all(source.join("inner")).expect("create dirs");
+        fs::write(source.join("file.txt"), "file").expect("write file");
+        fs::write(source.join("inner/child.txt"), "child").expect("write child");
+
+        let paths = upload_archive_paths(UploadSource::SinglePath {
+            local_path: source,
+            tar_name: "source-dir".into(),
+        });
+
+        assert!(paths.contains(&"source-dir/file.txt".to_string()));
+        assert!(paths.contains(&"source-dir/inner/child.txt".to_string()));
+        assert!(paths.iter().all(|path| path.starts_with("source-dir/")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_directory_archive_preserves_symlink_entries() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        fs::create_dir_all(source.join("real-dir")).expect("create dirs");
+        fs::write(source.join("real-dir/file.txt"), "file").expect("write file");
+        std::os::unix::fs::symlink("real-dir", source.join("link-dir")).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: source,
+            tar_name: "source-dir".into(),
+        });
+
+        let symlink = entries
+            .iter()
+            .find(|entry| entry.path == "source-dir/link-dir")
+            .expect("symlink archive entry");
+        assert_eq!(symlink.entry_type, tar::EntryType::Symlink);
+        assert_eq!(symlink.link_name.as_deref(), Some("real-dir"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.path != "source-dir/link-dir/file.txt"),
+            "symlink target should not be expanded into the archive: {entries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_archive_preserves_symlink_entries() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let base_dir = tmpdir.path().join("nested");
+        fs::create_dir_all(base_dir.join("real-dir")).expect("create dirs");
+        fs::write(base_dir.join("real-dir/file.txt"), "file").expect("write file");
+        std::os::unix::fs::symlink("real-dir", base_dir.join("link-dir")).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::FileList {
+            base_dir,
+            files: vec!["link-dir".into()],
+            archive_prefix: Some(PathBuf::from("nested")),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        let symlink = &entries[0];
+        assert_eq!(symlink.path, "nested/link-dir");
+        assert_eq!(symlink.entry_type, tar::EntryType::Symlink);
+        assert_eq!(symlink.link_name.as_deref(), Some("real-dir"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_symlink_archive_preserves_link_target() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        fs::write(tmpdir.path().join("target.txt"), "target").expect("write target");
+        let link = tmpdir.path().join("link.txt");
+        std::os::unix::fs::symlink("target.txt", &link).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: link,
+            tar_name: "uploaded-link.txt".into(),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        assert_eq!(entries[0].path, "uploaded-link.txt");
+        assert_eq!(entries[0].entry_type, tar::EntryType::Symlink);
+        assert_eq!(entries[0].link_name.as_deref(), Some("target.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_single_symlink_archive_preserves_link_target() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let link = tmpdir.path().join("dangling-link.txt");
+        std::os::unix::fs::symlink("missing.txt", &link).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: link,
+            tar_name: "dangling-link.txt".into(),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        assert_eq!(entries[0].path, "dangling-link.txt");
+        assert_eq!(entries[0].entry_type, tar::EntryType::Symlink);
+        assert_eq!(entries[0].link_name.as_deref(), Some("missing.txt"));
     }
 
     #[test]

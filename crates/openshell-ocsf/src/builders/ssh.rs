@@ -3,13 +3,11 @@
 
 //! Builder for SSH Activity [4007] events.
 
-use std::net::IpAddr;
-
 use crate::builders::SandboxContext;
 use crate::enums::{ActionId, ActivityId, AuthTypeId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{OcsfEvent, SshActivityEvent};
-use crate::objects::{Actor, Endpoint, Process};
+use crate::objects::{Actor, Endpoint};
 
 /// Builder for SSH Activity [4007] events.
 pub struct SshActivityBuilder<'a> {
@@ -48,52 +46,6 @@ impl<'a> SshActivityBuilder<'a> {
         }
     }
 
-    #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn src_endpoint_addr(mut self, ip: IpAddr, port: u16) -> Self {
-        self.src_endpoint = Some(Endpoint::from_ip(ip, port));
-        self
-    }
-    #[must_use]
-    pub fn dst_endpoint(mut self, ep: Endpoint) -> Self {
-        self.dst_endpoint = Some(ep);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
-
     /// Set auth type with a custom label (e.g., "NSSH1").
     #[must_use]
     pub fn auth_type(mut self, id: AuthTypeId, label: &str) -> Self {
@@ -122,14 +74,8 @@ impl<'a> SshActivityBuilder<'a> {
             self.ctx
                 .metadata(&["security_control", "container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::SshActivity(SshActivityEvent {
             base,
@@ -144,6 +90,13 @@ impl<'a> SshActivityBuilder<'a> {
         })
     }
 }
+
+impl_activity_setter!(SshActivityBuilder);
+impl_action_disposition_setters!(SshActivityBuilder);
+impl_actor_process_setter!(SshActivityBuilder);
+impl_dst_endpoint_setter!(SshActivityBuilder);
+impl_src_endpoint_addr_setter!(SshActivityBuilder);
+impl_builder_setters!(SshActivityBuilder);
 
 #[cfg(test)]
 mod tests {

@@ -6,7 +6,7 @@
 //! E2E test: TCP port forwarding through a sandbox.
 //!
 //! Prerequisites:
-//! - A running openshell gateway (`openshell gateway start`)
+//! - A running openshell gateway (`mise run gateway:docker`)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::time::Duration;
@@ -58,17 +58,14 @@ async fn port_forward_echo() {
     // ---------------------------------------------------------------
     // Step 1 — Create a sandbox with the echo server running.
     // ---------------------------------------------------------------
-    let mut guard =
-        SandboxGuard::create_keep(&["python3", "-c", &script], "echo-server-ready")
-            .await
-            .expect("sandbox create with echo server");
+    let mut guard = SandboxGuard::create_keep(&["python3", "-c", &script], "echo-server-ready")
+        .await
+        .expect("sandbox create with echo server");
 
     // ---------------------------------------------------------------
     // Step 2 — Start port forwarding in the background.
     // ---------------------------------------------------------------
-    let mut forward_child = guard
-        .spawn_forward(port)
-        .expect("spawn port forward");
+    let mut forward_child = guard.spawn_forward(port).expect("spawn port forward");
 
     // Wait for the local port to accept connections.
     wait_for_port("127.0.0.1", port, Duration::from_secs(30))

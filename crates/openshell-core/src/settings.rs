@@ -28,6 +28,32 @@ impl SettingValueKind {
 pub struct RegisteredSetting {
     pub key: &'static str,
     pub kind: SettingValueKind,
+    /// Optional whitelist of allowed string values. When `Some`, values
+    /// outside the list are rejected at configure time by every API surface
+    /// that goes through [`validate_string_value`] (CLI, TUI, gRPC). `None`
+    /// means the value is free-form and any string is accepted. Only
+    /// meaningful for [`SettingValueKind::String`] entries.
+    pub allowed_string_values: Option<&'static [&'static str]>,
+}
+
+impl RegisteredSetting {
+    /// Validate a string value against [`allowed_string_values`]. Returns
+    /// `Ok(())` when the setting has no constraint or when the value is in
+    /// the allowed list. On rejection, returns the allowed slice so callers
+    /// can format their own diagnostic.
+    ///
+    /// [`allowed_string_values`]: Self::allowed_string_values
+    ///
+    /// # Errors
+    ///
+    /// Returns the allowed-value slice when the setting has an
+    /// `allowed_string_values` whitelist and `value` is not in it.
+    pub fn validate_string_value(&self, value: &str) -> Result<(), &'static [&'static str]> {
+        match self.allowed_string_values {
+            Some(allowed) if !allowed.contains(&value) => Err(allowed),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Static registry of currently-supported runtime settings.
@@ -48,25 +74,68 @@ pub struct RegisteredSetting {
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
+pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
+
+/// Sandbox-level opt-in for the agent-driven policy proposal surface.
+///
+/// When true, the supervisor installs the `policy_advisor` skill, serves
+/// the `policy.local` API routes, and includes `next_steps` in L7 deny
+/// bodies. See `crates/openshell-sandbox/src/policy_local.rs`. Defaults to
+/// false. Independent of the per-proposal developer approval gate, which
+/// still applies when this flag is on.
+pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
+
+/// Approval mode for agent-authored policy proposals.
+///
+/// `"manual"` (the default when unset): every proposal lands in the draft
+/// inbox for human review, regardless of the prover verdict. `"auto"`:
+/// proposals whose prover delta is empty are approved automatically;
+/// proposals with findings still require human approval. Any other value
+/// (typos, future-reserved modes like `"auto_on_low_risk"`) falls back to
+/// manual — auto mode is an explicit, exact opt-in.
+///
+/// Resolution precedence (matches the rest of the settings model): gateway
+/// scope wins over sandbox scope. A reviewer can pin manual mode for a
+/// fleet by setting it globally; per-sandbox overrides only apply when no
+/// global is set.
+pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
+
+/// Allowed values for [`PROPOSAL_APPROVAL_MODE_KEY`].
+///
+/// Any other string is rejected at configure time (so operators get immediate
+/// feedback on typos like `"autom"`) while the runtime resolver still
+/// fail-closes on unknown persisted values for defense in depth.
+pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
+    // Gateway-level opt-in for provider profile policy composition. Defaults
+    // to false when unset.
+    RegisteredSetting {
+        key: PROVIDERS_V2_ENABLED_KEY,
+        kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
     // When true the sandbox writes OCSF v1.7.0 JSONL records to
     // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
         key: "ocsf_json_enabled",
         kind: SettingValueKind::Bool,
+        allowed_string_values: None,
     },
-    // Test-only keys live behind the `dev-settings` feature flag so they
-    // don't appear in production builds.
-    #[cfg(feature = "dev-settings")]
+    // Sandbox-level opt-in for the agent-driven policy proposal surface.
+    // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
     RegisteredSetting {
-        key: "dummy_int",
-        kind: SettingValueKind::Int,
-    },
-    #[cfg(feature = "dev-settings")]
-    RegisteredSetting {
-        key: "dummy_bool",
+        key: AGENT_POLICY_PROPOSALS_ENABLED_KEY,
         kind: SettingValueKind::Bool,
+        allowed_string_values: None,
+    },
+    // Approval mode for agent-authored proposals. See
+    // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
+    RegisteredSetting {
+        key: PROPOSAL_APPROVAL_MODE_KEY,
+        kind: SettingValueKind::String,
+        allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
     },
 ];
 
@@ -99,18 +168,10 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
+        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
         REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
         registered_keys_csv, setting_for_key,
     };
-
-    #[cfg(feature = "dev-settings")]
-    #[test]
-    fn setting_for_key_returns_dev_entries() {
-        let setting = setting_for_key("dummy_bool").expect("dummy_bool should be registered");
-        assert_eq!(setting.kind, SettingValueKind::Bool);
-        let setting = setting_for_key("dummy_int").expect("dummy_int should be registered");
-        assert_eq!(setting.kind, SettingValueKind::Int);
-    }
 
     #[test]
     fn setting_for_key_returns_none_for_unknown() {
@@ -121,6 +182,59 @@ mod tests {
     fn setting_for_key_returns_none_for_reserved_policy() {
         // "policy" is intentionally excluded from the registry.
         assert!(setting_for_key("policy").is_none());
+    }
+
+    #[test]
+    fn setting_for_key_returns_providers_v2_enabled() {
+        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Bool);
+    }
+
+    // ---- RegisteredSetting::validate_string_value ----
+
+    #[test]
+    fn validate_string_value_accepts_anything_when_unconstrained() {
+        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled should be registered");
+        // Bool-kind entries currently leave `allowed_string_values = None`;
+        // the helper still returns Ok for arbitrary strings.
+        assert!(setting.validate_string_value("anything").is_ok());
+        assert!(setting.validate_string_value("").is_ok());
+    }
+
+    #[test]
+    fn proposal_approval_mode_accepts_manual_and_auto() {
+        let setting = setting_for_key(PROPOSAL_APPROVAL_MODE_KEY)
+            .expect("proposal_approval_mode should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
+        assert_eq!(
+            setting.allowed_string_values,
+            Some(PROPOSAL_APPROVAL_MODE_VALUES)
+        );
+        assert!(setting.validate_string_value("manual").is_ok());
+        assert!(setting.validate_string_value("auto").is_ok());
+    }
+
+    #[test]
+    fn proposal_approval_mode_rejects_typos_and_future_modes() {
+        let setting = setting_for_key(PROPOSAL_APPROVAL_MODE_KEY)
+            .expect("proposal_approval_mode should be registered");
+        for bad in [
+            "autom",
+            "AUTO",
+            "Manual",
+            "",
+            " auto",
+            "auto_on_low_risk",
+            "yes",
+        ] {
+            let err = setting
+                .validate_string_value(bad)
+                .expect_err(&format!("expected '{bad}' to be rejected"));
+            // Caller gets the allowed slice back for diagnostics.
+            assert_eq!(err, PROPOSAL_APPROVAL_MODE_VALUES);
+        }
     }
 
     // ---- parse_bool_like ----
@@ -241,6 +355,7 @@ mod tests {
         let a = RegisteredSetting {
             key: "test",
             kind: SettingValueKind::Bool,
+            allowed_string_values: None,
         };
         let b = a;
         assert_eq!(a, b);

@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Common error types for OpenShell.
+//! Common error types for `OpenShell`.
 
 use miette::Diagnostic;
 use thiserror::Error;
 
-/// Result type alias using OpenShell's error type.
+/// Result type alias using `OpenShell`'s error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// OpenShell error type.
+/// `OpenShell` error type.
 #[derive(Debug, Error, Diagnostic)]
 pub enum Error {
     /// Configuration error.
@@ -100,6 +100,37 @@ impl Error {
     pub fn process(message: impl Into<String>) -> Self {
         Self::Process {
             message: message.into(),
+        }
+    }
+}
+
+/// Error type shared by all compute driver implementations.
+///
+/// Both the Podman and Kubernetes drivers map their backend-specific
+/// errors into these variants before crossing crate boundaries.
+#[derive(Debug, Error)]
+pub enum ComputeDriverError {
+    /// The requested sandbox already exists.
+    #[error("sandbox already exists")]
+    AlreadyExists,
+    /// The request contains an invalid argument.
+    #[error("{0}")]
+    InvalidArgument(String),
+    /// A precondition for the operation was not met.
+    #[error("{0}")]
+    Precondition(String),
+    /// Generic error message.
+    #[error("{0}")]
+    Message(String),
+}
+
+impl From<ComputeDriverError> for tonic::Status {
+    fn from(err: ComputeDriverError) -> Self {
+        match err {
+            ComputeDriverError::AlreadyExists => Self::already_exists("sandbox already exists"),
+            ComputeDriverError::InvalidArgument(m) => Self::invalid_argument(m),
+            ComputeDriverError::Precondition(m) => Self::failed_precondition(m),
+            ComputeDriverError::Message(m) => Self::internal(m),
         }
     }
 }

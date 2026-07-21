@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "e2e")]
+
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -68,8 +70,7 @@ async fn delete_sandbox(name: &str) {
 #[tokio::test]
 async fn sandbox_create_keeps_sandbox_after_tty_command_by_default() {
     let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--", "echo", "OK"]);
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -81,9 +82,13 @@ async fn sandbox_create_keeps_sandbox_after_tty_command_by_default() {
         "sandbox create should succeed (exit {:?}):\n{combined}",
         output.status.code()
     );
-    assert!(combined.contains("OK"), "expected command output in:\n{combined}");
+    assert!(
+        combined.contains("OK"),
+        "expected command output in:\n{combined}"
+    );
 
-    let sandbox_name = extract_sandbox_name(&combined).expect("sandbox name should be present in output");
+    let sandbox_name =
+        extract_sandbox_name(&combined).expect("sandbox name should be present in output");
 
     for _ in 0..20 {
         if sandbox_list_names().await.contains(&sandbox_name) {
@@ -111,7 +116,10 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
         "sandbox create should succeed (exit {:?}):\n{combined}",
         output.status.code()
     );
-    assert!(combined.contains("OK"), "expected command output in:\n{combined}");
+    assert!(
+        combined.contains("OK"),
+        "expected command output in:\n{combined}"
+    );
 
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");

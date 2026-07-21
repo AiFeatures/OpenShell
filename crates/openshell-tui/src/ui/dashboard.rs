@@ -4,8 +4,9 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
+use super::draw_empty_message;
 use crate::app::{App, Focus, MiddlePaneTab};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -40,6 +41,7 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from(Span::styled("  NAME", t.muted)),
         Cell::from(Span::styled("TYPE", t.muted)),
+        Cell::from(Span::styled("SOURCE", t.muted)),
         Cell::from(Span::styled("STATUS", t.muted)),
         Cell::from(Span::styled("", t.muted)),
     ])
@@ -92,6 +94,7 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Row::new(vec![
                 name_cell,
                 Cell::from(Span::styled(type_label, t.muted)),
+                Cell::from(Span::styled(entry.source_label(), t.muted)),
                 status_cell,
                 policy_cell,
             ])
@@ -107,9 +110,10 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .padding(Padding::horizontal(1));
 
     let widths = [
-        Constraint::Percentage(30),
+        Constraint::Percentage(24),
         Constraint::Percentage(10),
-        Constraint::Percentage(25),
+        Constraint::Percentage(10),
+        Constraint::Percentage(21),
         Constraint::Percentage(35),
     ];
 
@@ -118,13 +122,6 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(table, area);
 
     if app.gateways.is_empty() {
-        let inner = Rect {
-            x: area.x + 2,
-            y: area.y + 2,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(3),
-        };
-        let msg = Paragraph::new(Span::styled(" No gateways found.", t.muted));
-        frame.render_widget(msg, inner);
+        draw_empty_message(frame, area, " No gateways found.", t.muted);
     }
 }

@@ -1,59 +1,163 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s gateway.
+//! Build container images for sandbox runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the gateway's containerd runtime.
+//! from a Dockerfile and build context. Package-managed local gateways use the
+//! host Docker daemon, so the resulting tag is passed to the gateway directly.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::Docker;
 use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use tokio::time::timeout;
 
-use crate::constants::container_name;
-use crate::push::push_local_images;
-
-/// Build a container image from a Dockerfile and push it into the gateway.
+/// Maximum gap between Docker build stream events before a build is treated
+/// as stuck.
 ///
-/// This is used by `openshell sandbox create --from <Dockerfile>`. It:
-/// 1. Creates a tar archive of the build context directory.
-/// 2. Sends it to the local Docker daemon via `build_image()`.
-/// 3. Pushes the resulting image into the gateway's containerd via the
-///    existing `push_local_images()` pipeline.
+/// Total silence longer than this on under-provisioned container runtimes
+/// (e.g. default Colima 2 vCPU / 2 GiB on macOS) reliably indicates a
+/// deadlocked builder that will never recover. The default leaves headroom
+/// for legitimately quiet steps (a single long `RUN` that produces no output)
+/// — override with `OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS` if a specific
+/// build needs more time, or shorter for CI tightening.
+const DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS: u64 = 1800;
+
+async fn docker_daemon_platform(docker: &Docker) -> Result<String> {
+    let info = docker
+        .info()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to query local Docker daemon info")?;
+    let os = info
+        .os_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| miette::miette!("Docker daemon did not report an operating system"))?;
+    let arch = info
+        .architecture
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| miette::miette!("Docker daemon did not report an architecture"))?;
+
+    normalize_docker_platform(os, arch)
+}
+
+fn normalize_docker_platform(os: &str, arch: &str) -> Result<String> {
+    // Remote or non-standard daemons may return mixed-case arch strings.
+    let arch_lower = arch.to_lowercase();
+    let normalized_arch = match arch_lower.as_str() {
+        "amd64" | "x86_64" => "amd64",
+        "arm64" | "aarch64" => "arm64",
+        "arm" | "armv7" | "armv7l" | "armhf" => "arm/v7",
+        "armv6" | "armv6l" => "arm/v6",
+        "386" | "i386" | "i686" => "386",
+        "ppc64le" => "ppc64le",
+        "s390x" => "s390x",
+        _ => {
+            return Err(miette::miette!(
+                "unsupported Docker daemon architecture for local image build: {arch}"
+            ));
+        }
+    };
+    Ok(format!("{os}/{normalized_arch}"))
+}
+
+/// Parse `os/arch[/variant]` and reject malformed empty segments.
+fn parse_platform(platform: &str) -> Result<(&str, &str, &str)> {
+    let mut parts = platform.split('/');
+    let os = parts
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| miette::miette!("platform is missing an operating system"))?;
+    let arch = parts
+        .next()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| miette::miette!("platform is missing an architecture"))?;
+    // A trailing slash creates a malformed empty variant segment.
+    let variant = match parts.next() {
+        Some("") => {
+            return Err(miette::miette!(
+                "platform variant must not be empty (trailing slash?): '{platform}'"
+            ));
+        }
+        Some(v) => v,
+        None => "",
+    };
+    if parts.next().is_some() {
+        return Err(miette::miette!(
+            "platform must be os/arch[/variant], got '{platform}'"
+        ));
+    }
+    Ok((os, arch, variant))
+}
+
+/// Seed Docker's implicit `BuildKit` platform args without replacing caller values.
+///
+/// `target_platform` identifies the output image. `build_platform` identifies
+/// the Docker daemon doing the build. Variant args are only injected when the
+/// platform string has an explicit variant, which preserves Dockerfile ARG
+/// defaults for no-variant platforms.
+fn insert_implicit_platform_build_args(
+    build_args: &mut HashMap<String, String>,
+    target_platform: &str,
+    build_platform: &str,
+) -> Result<()> {
+    let (target_os, target_arch, target_variant) = parse_platform(target_platform)
+        .wrap_err_with(|| format!("invalid target platform '{target_platform}'"))?;
+    let (build_os, build_arch, build_variant) = parse_platform(build_platform)
+        .wrap_err_with(|| format!("invalid build platform '{build_platform}'"))?;
+
+    for (key, val) in [
+        ("TARGETPLATFORM", target_platform),
+        ("TARGETOS", target_os),
+        ("TARGETARCH", target_arch),
+        ("BUILDPLATFORM", build_platform),
+        ("BUILDOS", build_os),
+        ("BUILDARCH", build_arch),
+    ] {
+        build_args
+            .entry(key.to_string())
+            .or_insert_with(|| val.to_string());
+    }
+    if !target_variant.is_empty() {
+        build_args
+            .entry("TARGETVARIANT".to_string())
+            .or_insert_with(|| target_variant.to_string());
+    }
+    if !build_variant.is_empty() {
+        build_args
+            .entry("BUILDVARIANT".to_string())
+            .or_insert_with(|| build_variant.to_string());
+    }
+
+    Ok(())
+}
+
+/// Build a container image from a Dockerfile using the local Docker daemon.
+///
+/// This is used by `openshell sandbox create --from <Dockerfile>`. The image
+/// remains available in the local Docker daemon so the gateway's active local
+/// compute driver can resolve the tag.
 #[allow(clippy::implicit_hasher)]
-pub async fn build_and_push_image(
+pub async fn build_local_image(
     dockerfile_path: &Path,
     tag: &str,
     context_dir: &Path,
-    gateway_name: &str,
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    // 1. Build the image locally.
     on_log(format!(
         "Building image {tag} from {}",
         dockerfile_path.display()
     ));
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
-
-    // 2. Push into the gateway.
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    let local_docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
     Ok(())
 }
 
@@ -71,6 +175,18 @@ async fn build_image(
     let docker = Docker::connect_with_local_defaults()
         .into_diagnostic()
         .wrap_err("failed to connect to local Docker daemon")?;
+    // BUILD* always comes from daemon info. A TARGETPLATFORM override only
+    // changes the output image platform.
+    let build_platform = docker_daemon_platform(&docker).await?;
+    let target_platform = build_args
+        .get("TARGETPLATFORM")
+        .map_or_else(|| build_platform.clone(), Clone::clone);
+    let mut effective_build_args = build_args.clone();
+    insert_implicit_platform_build_args(
+        &mut effective_build_args,
+        &target_platform,
+        &build_platform,
+    )?;
 
     // Compute the relative path of the Dockerfile within the context.
     let dockerfile_relative = dockerfile_path
@@ -86,20 +202,42 @@ async fn build_image(
     let mut builder = BuildImageOptionsBuilder::default()
         .dockerfile(dockerfile_str)
         .t(tag)
-        .rm(true);
+        .rm(true)
+        .platform(&target_platform);
 
     // Pass build args to Docker.
-    if !build_args.is_empty() {
-        builder = builder.buildargs(build_args);
+    if !effective_build_args.is_empty() {
+        builder = builder.buildargs(&effective_build_args);
     }
 
     let options = builder.build();
 
     let body = bollard::body_full(bytes::Bytes::from(context_tar));
     let mut stream = docker.build_image(options, None, Some(body));
+    let no_progress_secs: u64 = std::env::var("OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS);
+    let no_progress_timeout = Duration::from_secs(no_progress_secs);
 
-    while let Some(result) = stream.next().await {
-        let info = result
+    loop {
+        let next = match timeout(no_progress_timeout, stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(miette::miette!(
+                    "Docker build produced no output for {}s. This usually means the container \
+                     runtime is under-provisioned (CPU/memory) and the builder has deadlocked; \
+                     check `docker info` (NCPU, MemTotal) and increase Colima/Docker Desktop \
+                     resources before retrying. If a legitimate build step is just quiet, raise \
+                     the threshold with OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS=<secs>.",
+                    no_progress_timeout.as_secs()
+                ));
+            }
+        };
+
+        let info = next
             .into_diagnostic()
             .wrap_err("Docker build stream error")?;
 
@@ -464,5 +602,73 @@ mod tests {
         }];
         assert!(is_ignored("node_modules", true, &patterns));
         assert!(is_ignored("node_modules/foo.js", false, &patterns));
+    }
+
+    #[test]
+    fn test_normalize_docker_platform_maps_docker_desktop_arch() {
+        assert_eq!(
+            normalize_docker_platform("linux", "aarch64").unwrap(),
+            "linux/arm64"
+        );
+        assert_eq!(
+            normalize_docker_platform("linux", "x86_64").unwrap(),
+            "linux/amd64"
+        );
+    }
+
+    #[test]
+    fn test_normalize_docker_platform_case_insensitive_arch() {
+        // Some remote or non-standard Docker daemons return mixed-case arch strings.
+        assert_eq!(
+            normalize_docker_platform("linux", "ARM64").unwrap(),
+            "linux/arm64"
+        );
+        assert_eq!(
+            normalize_docker_platform("linux", "X86_64").unwrap(),
+            "linux/amd64"
+        );
+    }
+
+    #[test]
+    fn test_insert_implicit_platform_build_args_native() {
+        // Native builds use one platform for both target and build args.
+        let mut build_args = HashMap::new();
+        insert_implicit_platform_build_args(&mut build_args, "linux/arm/v7", "linux/arm/v7")
+            .unwrap();
+
+        assert_eq!(build_args.get("TARGETPLATFORM").unwrap(), "linux/arm/v7");
+        assert_eq!(build_args.get("TARGETOS").unwrap(), "linux");
+        assert_eq!(build_args.get("TARGETARCH").unwrap(), "arm");
+        assert_eq!(build_args.get("TARGETVARIANT").unwrap(), "v7");
+        assert_eq!(build_args.get("BUILDPLATFORM").unwrap(), "linux/arm/v7");
+        assert_eq!(build_args.get("BUILDOS").unwrap(), "linux");
+        assert_eq!(build_args.get("BUILDARCH").unwrap(), "arm");
+        assert_eq!(build_args.get("BUILDVARIANT").unwrap(), "v7");
+    }
+
+    #[test]
+    fn test_insert_implicit_platform_build_args_cross_compile() {
+        // Cross-builds keep daemon BUILD* args separate from target args.
+        let mut build_args = HashMap::new();
+        insert_implicit_platform_build_args(&mut build_args, "linux/arm64", "linux/amd64").unwrap();
+
+        assert_eq!(build_args.get("TARGETPLATFORM").unwrap(), "linux/arm64");
+        assert_eq!(build_args.get("TARGETARCH").unwrap(), "arm64");
+        assert_eq!(build_args.get("BUILDPLATFORM").unwrap(), "linux/amd64");
+        assert_eq!(build_args.get("BUILDARCH").unwrap(), "amd64");
+        // Leaving variant args absent preserves Dockerfile ARG defaults.
+        assert!(!build_args.contains_key("TARGETVARIANT"));
+        assert!(!build_args.contains_key("BUILDVARIANT"));
+    }
+
+    #[test]
+    fn test_insert_implicit_platform_build_args_trailing_slash_rejected() {
+        let mut build_args = HashMap::new();
+        let result =
+            insert_implicit_platform_build_args(&mut build_args, "linux/arm64/", "linux/amd64");
+        assert!(
+            result.is_err(),
+            "trailing slash should be rejected as a malformed variant segment"
+        );
     }
 }

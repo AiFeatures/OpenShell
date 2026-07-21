@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Network IP classification utilities shared across OpenShell crates.
+//! Network IP classification utilities shared across `OpenShell` crates.
 //!
 //! These helpers enforce the always-blocked IP invariant (loopback, link-local,
 //! unspecified) and the broader internal-IP classification (adds RFC 1918 and
@@ -11,6 +11,41 @@
 //! - The gateway server for defense-in-depth validation on approval
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Check if a hostname is a known cloud metadata hostname that resolves to an
+/// always-blocked metadata service.
+///
+/// This is intentionally a static name check. Do not perform DNS resolution in
+/// policy validation or proposal generation paths.
+pub fn is_known_metadata_hostname(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(normalized.as_str(), "metadata.google.internal")
+}
+
+/// Check if an IP address is link-local.
+///
+/// Covers IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`, and IPv4-mapped IPv6
+/// addresses whose embedded IPv4 address is link-local (`::ffff:169.254.x.x`).
+///
+/// This is a point-check helper used to build the always-blocked and
+/// trusted-gateway exemption predicates. For CIDR-range overlap checks see
+/// [`is_always_blocked_net`].
+pub fn is_link_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // fe80::/10 — IPv6 link-local
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // ::ffff:169.254.x.x — IPv4-mapped link-local
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_link_local();
+            }
+            false
+        }
+    }
+}
 
 /// Check if an IP address is always blocked regardless of policy.
 ///
@@ -24,13 +59,12 @@ pub fn is_always_blocked_ip(ip: IpAddr) -> bool {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+            if is_link_local_ip(IpAddr::V6(v6)) {
                 return true;
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
+                return v4.is_loopback() || v4.is_unspecified();
             }
             false
         }
@@ -97,11 +131,23 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
                 return true;
             }
 
-            // Check IPv4-mapped IPv6 (::ffff:127.0.0.1, ::ffff:169.254.x.x, etc.)
-            if let Some(v4) = network.to_ipv4_mapped() {
-                if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
-                    return true;
-                }
+            // Check IPv4-mapped IPv6 addresses. The network-address check covers
+            // ranges whose first address is already in a blocked range
+            // (e.g. ::ffff:127.0.0.1/128, ::ffff:169.254.0.1/128). The
+            // containment checks below catch broader prefixes that only reach
+            // into a blocked range further in — e.g. ::ffff:168.0.0.0/103
+            // has a public network address but spans ::ffff:169.254.0.0.
+            if network
+                .to_ipv4_mapped()
+                .is_some_and(|v4| v4.is_loopback() || v4.is_link_local() || v4.is_unspecified())
+            {
+                return true;
+            }
+            if v6net.contains(&Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::new(169, 254, 0, 0).to_ipv6_mapped())
+                || v6net.contains(&Ipv4Addr::UNSPECIFIED.to_ipv6_mapped())
+            {
+                return true;
             }
 
             false
@@ -121,13 +167,12 @@ pub fn is_always_blocked_net(net: ipnet::IpNet) -> bool {
 /// when `allowed_ips` should be populated in proposals.
 pub fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => is_internal_v4(&v4),
+        IpAddr::V4(v4) => is_internal_v4(v4),
         IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+            if is_link_local_ip(IpAddr::V6(v6)) {
                 return true;
             }
             // fc00::/7 — IPv6 unique local addresses (ULA)
@@ -136,7 +181,7 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_internal_v4(&v4);
+                return is_internal_v4(v4);
             }
             false
         }
@@ -145,30 +190,32 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
 
 /// IPv4 internal address check covering RFC 1918, CGNAT (RFC 6598), and other
 /// special-use ranges that should never be reachable from sandbox egress.
-fn is_internal_v4(v4: &Ipv4Addr) -> bool {
-    if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+fn is_internal_v4(v4: Ipv4Addr) -> bool {
+    // Prefer the stable `Ipv4Addr` predicates. `is_documentation()` (RFC 5737)
+    // covers all three TEST-NET ranges, including 192.0.2.0/24 (TEST-NET-1) which
+    // the previous manual checks missed.
+    if v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || v4.is_broadcast()
+    {
         return true;
     }
     let octets = v4.octets();
-    // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598). Commonly used by
-    // cloud VPC peering, Tailscale, and similar overlay networks.
+    // The ranges below have no stable std predicate yet, so keep them manual.
+    // 100.64.0.0/10 — CGNAT / shared address space (RFC 6598; `is_shared` is
+    // unstable). Commonly used by cloud VPC peering, Tailscale, and similar overlays.
     if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
         return true;
     }
-    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
+    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890; no stable predicate).
     if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
         return true;
     }
-    // 198.18.0.0/15 — benchmarking (RFC 2544)
+    // 198.18.0.0/15 — benchmarking (RFC 2544; `is_benchmarking` is unstable).
     if octets[0] == 198 && (octets[1] & 0xFE) == 18 {
-        return true;
-    }
-    // 198.51.100.0/24 — TEST-NET-2 (RFC 5737)
-    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
-        return true;
-    }
-    // 203.0.113.0/24 — TEST-NET-3 (RFC 5737)
-    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
         return true;
     }
     false
@@ -177,6 +224,84 @@ fn is_internal_v4(v4: &Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- is_known_metadata_hostname --
+
+    #[test]
+    fn test_known_metadata_hostname_accepts_gcp_variants() {
+        assert!(is_known_metadata_hostname("metadata.google.internal"));
+        assert!(is_known_metadata_hostname("METADATA.GOOGLE.INTERNAL"));
+        assert!(is_known_metadata_hostname("metadata.google.internal."));
+    }
+
+    #[test]
+    fn test_known_metadata_hostname_rejects_public_hosts() {
+        assert!(!is_known_metadata_hostname("api.github.com"));
+        assert!(!is_known_metadata_hostname(""));
+    }
+
+    // -- is_link_local_ip --
+
+    #[test]
+    fn test_link_local_ip_v4() {
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_v6_fe80() {
+        assert!(is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // Upper boundary of fe80::/10 (febf:...)
+        assert!(is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_v6_mapped_v4() {
+        let mapped = Ipv4Addr::new(169, 254, 1, 2).to_ipv6_mapped();
+        assert!(is_link_local_ip(IpAddr::V6(mapped)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_loopback() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_unspecified() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_rfc1918() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))));
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_public() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_v6_mapped_loopback() {
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(!is_link_local_ip(IpAddr::V6(mapped)));
+    }
 
     // -- is_always_blocked_ip --
 
@@ -332,6 +457,42 @@ mod tests {
         assert!(is_always_blocked_net(net));
     }
 
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_loopback_single() {
+        let net: ipnet::IpNet = "::ffff:127.0.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_link_local_single() {
+        let net: ipnet::IpNet = "::ffff:169.254.0.1/128".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_link_local() {
+        // ::ffff:168.0.0.0/103 has a public network address (168.0.0.0) but
+        // the range covers 168.0.0.0–169.255.255.255, which includes the
+        // link-local block 169.254.0.0/16.
+        let net: ipnet::IpNet = "::ffff:168.0.0.0/103".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_broad_spans_loopback() {
+        // ::ffff:64.0.0.0/98 has a public network address (64.0.0.0) but the
+        // range covers 64.0.0.0–127.255.255.255, which includes loopback.
+        let net: ipnet::IpNet = "::ffff:64.0.0.0/98".parse().unwrap();
+        assert!(is_always_blocked_net(net));
+    }
+
+    #[test]
+    fn test_always_blocked_net_v6_ipv4_mapped_allows_public() {
+        // ::ffff:8.8.8.8/128 is a public address — should not be blocked.
+        let net: ipnet::IpNet = "::ffff:8.8.8.8/128".parse().unwrap();
+        assert!(!is_always_blocked_net(net));
+    }
+
     // -- is_internal_ip --
 
     #[test]
@@ -408,10 +569,14 @@ mod tests {
         // 198.18.0.0/15 — benchmarking
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255))));
+        // 192.0.2.0/24 — TEST-NET-1 (RFC 5737), now covered via is_documentation()
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
         // 198.51.100.0/24 — TEST-NET-2
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))));
         // 203.0.113.0/24 — TEST-NET-3
         assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        // 255.255.255.255 — limited broadcast (RFC 919), via is_broadcast()
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::BROADCAST)));
     }
 
     #[test]
