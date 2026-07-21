@@ -6,13 +6,74 @@
 mod postgres;
 mod sqlite;
 
-use openshell_core::{Error, Result};
+pub use openshell_core::proto::{
+    StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
+};
+
+use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use thiserror::Error;
 
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
+
+/// Object type string for sandbox policy records.
+pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
+/// Object type string for draft policy chunk records.
+pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+
+pub type PersistenceResult<T> = Result<T, PersistenceError>;
+
+/// Persistence-layer error type.
+#[derive(Debug, Error, Clone)]
+pub enum PersistenceError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("migration error: {0}")]
+    Migration(String),
+    #[error("decode error: {0}")]
+    Decode(String),
+    #[error("encode error: {0}")]
+    Encode(String),
+    #[error("unique violation{constraint_msg}")]
+    UniqueViolation {
+        constraint: Option<String>,
+        detail: Option<String>,
+        constraint_msg: String,
+    },
+    #[error("resource version conflict: expected version does not match current")]
+    Conflict {
+        current_resource_version: Option<u64>,
+    },
+}
+
+impl PersistenceError {
+    pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {
+        let constraint_msg = constraint
+            .as_ref()
+            .map(|value| format!(" on {value}"))
+            .unwrap_or_default();
+        Self::UniqueViolation {
+            constraint,
+            detail,
+            constraint_msg,
+        }
+    }
+
+    pub fn is_unique_violation_on(&self, constraint: &str) -> bool {
+        matches!(
+            self,
+            Self::UniqueViolation {
+                constraint: Some(value),
+                ..
+            } if value == constraint
+        )
+    }
+}
 
 /// Stored object record.
 #[derive(Debug, Clone)]
@@ -20,23 +81,34 @@ pub struct ObjectRecord {
     pub object_type: String,
     pub id: String,
     pub name: String,
+    pub workspace: String,
     pub payload: Vec<u8>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// JSON-serialized labels (key-value pairs).
+    pub labels: Option<String>,
+    /// Optimistic concurrency control version.
+    /// Incremented on each update for compare-and-swap operations.
+    pub resource_version: u64,
 }
 
-/// Stored sandbox policy revision record.
+/// Write condition for compare-and-swap operations.
+#[derive(Debug, Clone, Copy)]
+pub enum WriteCondition {
+    /// Object must not exist (insert only).
+    MustCreate,
+    /// Object must exist with the specified resource version (update only).
+    MatchResourceVersion(u64),
+    /// Unconditional write (insert or update).
+    Unconditional,
+}
+
+/// Result of a successful write operation.
 #[derive(Debug, Clone)]
-pub struct PolicyRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub version: i64,
-    pub policy_payload: Vec<u8>,
-    pub policy_hash: String,
-    pub status: String,
-    pub load_error: Option<String>,
+pub struct WriteResult {
+    pub resource_version: u64,
     pub created_at_ms: i64,
-    pub loaded_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
 }
 
 /// Persistence store implementations.
@@ -51,15 +123,11 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-/// Trait for extracting an object id from a message instance.
-pub trait ObjectId {
-    fn object_id(&self) -> &str;
-}
-
-/// Trait for extracting an object name from a message instance.
-pub trait ObjectName {
-    fn object_name(&self) -> &str;
-}
+// Import object metadata accessor traits from openshell-core
+// (implementations for all proto types are in openshell-core::metadata)
+pub use openshell_core::{
+    GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
+};
 
 /// Generate a random 6-character lowercase alphabetic name.
 pub fn generate_name() -> String {
@@ -69,356 +137,646 @@ pub fn generate_name() -> String {
         .collect()
 }
 
+/// Decode a single [`ObjectRecord`] into a protobuf message, hydrating
+/// `resource_version` from the authoritative DB row.
+///
+/// Only `resource_version` is hydrated here; `workspace` is NOT backfilled from
+/// the DB column because the workspace field is authoritative in the protobuf
+/// payload at creation time. This is a breaking upgrade — pre-workspace records
+/// will carry an empty workspace until they are re-created.
+///
+/// Extracted to avoid repeating the identical decode-and-hydrate block across
+/// `get_message`, `get_message_by_name`, `list_messages`, and
+/// `list_messages_with_selector`.
+fn decode_record<T: Message + Default + SetResourceVersion>(
+    record: ObjectRecord,
+) -> PersistenceResult<T> {
+    let mut message = T::decode(record.payload.as_slice())
+        .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+    message.set_resource_version(record.resource_version);
+    Ok(message)
+}
+
+/// Dispatch a method call to the underlying store implementation.
+///
+/// Every `Store` method is a two-arm `match self { Postgres(s) => s.method(...).await, … }`
+/// with no logic of its own. This macro captures the common pattern so that
+/// each method body is a single line.
+macro_rules! store_dispatch {
+    ($self:ident . $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            Self::Postgres(s) => s.$method($($arg),*).await,
+            Self::Sqlite(s) => s.$method($($arg),*).await,
+        }
+    };
+}
+
 impl Store {
+    /// Returns `true` for single-replica backends (`SQLite`) where no lease
+    /// coordination is needed, `false` for multi-replica backends (`Postgres`).
+    pub fn is_single_replica(&self) -> bool {
+        matches!(self, Self::Sqlite(_))
+    }
+
     /// Connect to a persistence store based on the database URL.
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &str) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url).await?;
-            store.migrate().await?;
+            let store = PostgresStore::connect(url)
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
+            store
+                .migrate()
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
-            let store = SqliteStore::connect(url).await?;
-            store.migrate().await?;
+            let store = SqliteStore::connect(url)
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
+            store
+                .migrate()
+                .await
+                .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Sqlite(store))
         } else {
-            Err(Error::config(format!(
+            Err(CoreError::config(format!(
                 "unsupported database URL scheme: {url}"
             )))
         }
     }
 
-    /// Insert or update an object.
-    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
-        match self {
-            Self::Postgres(store) => store.put(object_type, id, name, payload).await,
-            Self::Sqlite(store) => store.put(object_type, id, name, payload).await,
-        }
+    /// Verify connectivity to the underlying database.
+    pub async fn ping(&self) -> PersistenceResult<()> {
+        store_dispatch!(self.ping())
+    }
+
+    /// Test support only: close the underlying connection pool.
+    ///
+    /// There is no runtime shutdown path yet. If we add graceful shutdown,
+    /// this API can be made public for that explicit shutdown flow.
+    ///
+    /// Do not call from runtime code today; this tears down the active pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close(&self) {
+        store_dispatch!(self.close());
+    }
+
+    /// Insert or update a generic object with compare-and-swap support.
+    ///
+    /// # Arguments
+    /// * `object_type` - Type discriminator for the object
+    /// * `id` - Stable object identifier
+    /// * `name` - Human-readable object name
+    /// * `workspace` - Workspace scope for multi-tenant isolation
+    /// * `payload` - Serialized object data
+    /// * `labels` - Optional JSON-serialized labels
+    /// * `condition` - Write precondition (`MustCreate`, `MatchResourceVersion`, or `Unconditional`)
+    ///
+    /// # Returns
+    /// * `Ok(WriteResult)` - Write succeeded with new `resource_version` and timestamps
+    /// * `Err(Conflict)` - Resource version mismatch (for `MatchResourceVersion`)
+    /// * `Err(UniqueViolation)` - Object already exists (for `MustCreate`) or name conflict
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        condition: WriteCondition,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch!(self.put_if(object_type, id, name, workspace, payload, labels, condition))
+    }
+
+    /// Delete an object by id with compare-and-swap support.
+    ///
+    /// # Arguments
+    /// * `object_type` - Type discriminator for the object
+    /// * `id` - Stable object identifier
+    /// * `expected_resource_version` - Required resource version for the delete to proceed
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Object was deleted
+    /// * `Ok(false)` - Object not found
+    /// * `Err(Conflict)` - Resource version mismatch
+    pub async fn delete_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(self.delete_if(object_type, id, expected_resource_version))
+    }
+
+    /// Insert or update a generic named object with an application-owned scope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<()> {
+        store_dispatch!(self.put_scoped(object_type, id, name, workspace, scope, payload, labels))
     }
 
     /// Fetch an object by id.
-    pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.get(object_type, id).await,
-            Self::Sqlite(store) => store.get(object_type, id).await,
-        }
+    pub async fn get(
+        &self,
+        object_type: &str,
+        id: &str,
+    ) -> PersistenceResult<Option<ObjectRecord>> {
+        store_dispatch!(self.get(object_type, id))
     }
 
-    /// Fetch an object by name within an object type.
-    pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_by_name(object_type, name).await,
-            Self::Sqlite(store) => store.get_by_name(object_type, name).await,
-        }
+    /// Fetch an object by name within an object type and workspace.
+    pub async fn get_by_name(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        name: &str,
+    ) -> PersistenceResult<Option<ObjectRecord>> {
+        store_dispatch!(self.get_by_name(object_type, workspace, name))
     }
 
     /// Delete an object by id.
-    pub async fn delete(&self, object_type: &str, id: &str) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => store.delete(object_type, id).await,
-            Self::Sqlite(store) => store.delete(object_type, id).await,
-        }
+    pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
+        store_dispatch!(self.delete(object_type, id))
     }
 
-    /// Delete an object by name within an object type.
-    pub async fn delete_by_name(&self, object_type: &str, name: &str) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => store.delete_by_name(object_type, name).await,
-            Self::Sqlite(store) => store.delete_by_name(object_type, name).await,
-        }
+    /// Count objects of a given type within a workspace.
+    pub async fn count_in_workspace(
+        &self,
+        object_type: &str,
+        workspace: &str,
+    ) -> PersistenceResult<u64> {
+        store_dispatch!(self.count_in_workspace(object_type, workspace))
     }
 
-    /// List objects by type.
+    /// Delete all objects of a given type within a workspace.
+    pub async fn delete_all_in_workspace(
+        &self,
+        object_type: &str,
+        workspace: &str,
+    ) -> PersistenceResult<u64> {
+        store_dispatch!(self.delete_all_in_workspace(object_type, workspace))
+    }
+
+    /// Delete all objects of a given type with a matching scope.
+    pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
+        store_dispatch!(self.delete_by_scope(object_type, scope))
+    }
+
+    /// Delete an object by name within an object type and workspace.
+    pub async fn delete_by_name(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        name: &str,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(self.delete_by_name(object_type, workspace, name))
+    }
+
+    /// List objects by type and workspace.
     pub async fn list(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list(object_type, workspace, limit, offset))
+    }
+
+    /// List objects by type across all workspaces.
+    pub async fn list_by_type(
         &self,
         object_type: &str,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.list(object_type, limit, offset).await,
-            Self::Sqlite(store) => store.list(object_type, limit, offset).await,
-        }
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_by_type(object_type, limit, offset))
     }
 
-    // -----------------------------------------------------------------------
-    // Policy revision operations
-    // -----------------------------------------------------------------------
-
-    /// Insert a new policy revision.
-    pub async fn put_policy_revision(
+    /// List objects by type and application-owned scope.
+    ///
+    /// Workspace filtering is intentionally omitted: scope values are sandbox
+    /// UUIDs which are globally unique. Revisit if non-UUID scopes are introduced.
+    pub async fn list_by_scope(
         &self,
-        id: &str,
-        sandbox_id: &str,
-        version: i64,
-        payload: &[u8],
-        hash: &str,
-    ) -> Result<()> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
-                    .await
-            }
-        }
-    }
-
-    /// Get the latest policy revision for a sandbox (by highest version, any status).
-    pub async fn get_latest_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_latest_policy(sandbox_id).await,
-            Self::Sqlite(store) => store.get_latest_policy(sandbox_id).await,
-        }
-    }
-
-    /// Get the latest loaded policy revision for a sandbox.
-    pub async fn get_latest_loaded_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_latest_loaded_policy(sandbox_id).await,
-            Self::Sqlite(store) => store.get_latest_loaded_policy(sandbox_id).await,
-        }
-    }
-
-    /// Get a specific policy revision by sandbox id and version.
-    pub async fn get_policy_by_version(
-        &self,
-        sandbox_id: &str,
-        version: i64,
-    ) -> Result<Option<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_policy_by_version(sandbox_id, version).await,
-            Self::Sqlite(store) => store.get_policy_by_version(sandbox_id, version).await,
-        }
-    }
-
-    /// List policy revisions for a sandbox, ordered by version descending.
-    pub async fn list_policies(
-        &self,
-        sandbox_id: &str,
+        object_type: &str,
+        scope: &str,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<PolicyRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_policies(sandbox_id, limit, offset).await,
-            Self::Sqlite(store) => store.list_policies(sandbox_id, limit, offset).await,
-        }
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_by_scope(object_type, scope, limit, offset))
     }
 
-    /// Update the status of a policy revision.
-    pub async fn update_policy_status(
+    /// List objects by type and workspace with label selector filtering.
+    /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
+    pub async fn list_with_selector(
         &self,
-        sandbox_id: &str,
-        version: i64,
-        status: &str,
-        load_error: Option<&str>,
-        loaded_at_ms: Option<i64>,
-    ) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
-                    .await
-            }
-        }
+        object_type: &str,
+        workspace: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_selector(
+            object_type,
+            workspace,
+            label_selector,
+            limit,
+            offset
+        ))
     }
 
-    /// Mark all pending and loaded policy revisions older than `before_version` as superseded.
-    pub async fn supersede_older_policies(
+    /// List objects by type across all workspaces with label selector filtering.
+    pub async fn list_all_with_selector(
         &self,
-        sandbox_id: &str,
-        before_version: i64,
-    ) -> Result<u64> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .supersede_older_policies(sandbox_id, before_version)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .supersede_older_policies(sandbox_id, before_version)
-                    .await
-            }
-        }
+        object_type: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_all_with_selector(object_type, label_selector, limit, offset))
     }
 
     // -----------------------------------------------------------------------
     // Generic protobuf message helpers
     // -----------------------------------------------------------------------
 
-    /// Insert or update a protobuf message using its inferred object type, id, and name.
-    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName>(
+    /// Insert or update a protobuf message under an application-owned scope.
+    pub async fn put_scoped_message<
+        T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels + ObjectWorkspace,
+    >(
         &self,
         message: &T,
-    ) -> Result<()> {
-        self.put(
+        scope: &str,
+    ) -> PersistenceResult<()> {
+        if T::requires_workspace() && message.object_workspace().is_empty() {
+            return Err(PersistenceError::Encode(format!(
+                "{} requires a non-empty workspace",
+                T::object_type(),
+            )));
+        }
+        let labels_map = message.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
+
+        self.put_scoped(
             T::object_type(),
             message.object_id(),
             message.object_name(),
+            message.object_workspace(),
+            scope,
             &message.encode_to_vec(),
+            labels_json.as_deref(),
         )
         .await
     }
 
     /// Fetch and decode a protobuf message by id.
-    pub async fn get_message<T: Message + Default + ObjectType>(
+    pub async fn get_message<T: Message + Default + ObjectType + SetResourceVersion>(
         &self,
         id: &str,
-    ) -> Result<Option<T>> {
-        let record = self.get(T::object_type(), id).await?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
+    ) -> PersistenceResult<Option<T>> {
+        self.get(T::object_type(), id)
+            .await?
+            .map(decode_record)
+            .transpose()
     }
 
-    /// Fetch and decode a protobuf message by name.
-    pub async fn get_message_by_name<T: Message + Default + ObjectType>(
+    /// Fetch and decode a protobuf message by workspace and name.
+    pub async fn get_message_by_name<T: Message + Default + ObjectType + SetResourceVersion>(
         &self,
+        workspace: &str,
         name: &str,
-    ) -> Result<Option<T>> {
-        let record = self.get_by_name(T::object_type(), name).await?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
+    ) -> PersistenceResult<Option<T>> {
+        self.get_by_name(T::object_type(), workspace, name)
+            .await?
+            .map(decode_record)
+            .transpose()
     }
 
-    // -----------------------------------------------------------------------
-    // Draft policy chunk operations
-    // -----------------------------------------------------------------------
-
-    /// Insert a new draft policy chunk.
-    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> Result<()> {
-        match self {
-            Self::Postgres(store) => store.put_draft_chunk(chunk).await,
-            Self::Sqlite(store) => store.put_draft_chunk(chunk).await,
-        }
-    }
-
-    /// Fetch a single draft chunk by id.
-    pub async fn get_draft_chunk(&self, id: &str) -> Result<Option<DraftChunkRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_draft_chunk(id).await,
-            Self::Sqlite(store) => store.get_draft_chunk(id).await,
-        }
-    }
-
-    /// List draft chunks for a sandbox, optionally filtered by status.
-    pub async fn list_draft_chunks(
+    /// List and decode protobuf messages by workspace, hydrating
+    /// `resource_version` from the authoritative DB row (mirrors `get_message`).
+    pub async fn list_messages<T: Message + Default + ObjectType + SetResourceVersion>(
         &self,
-        sandbox_id: &str,
-        status_filter: Option<&str>,
-    ) -> Result<Vec<DraftChunkRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
-            Self::Sqlite(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
-        }
+        workspace: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list(T::object_type(), workspace, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
     }
 
-    /// Update the status of a draft chunk.
-    pub async fn update_draft_chunk_status(
+    /// List and decode protobuf messages across all workspaces, hydrating
+    /// `resource_version` from the authoritative DB row.
+    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_by_type(T::object_type(), limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// List and decode protobuf messages across all workspaces with label
+    /// selector filtering, hydrating `resource_version` from the authoritative
+    /// DB row.
+    pub async fn list_all_messages_with_selector<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_all_with_selector(T::object_type(), label_selector, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// List and decode protobuf messages with label selector filtering,
+    /// hydrating `resource_version` from the authoritative DB row.
+    pub async fn list_messages_with_selector<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        workspace: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_with_selector(T::object_type(), workspace, label_selector, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
+    }
+
+    /// Update a protobuf message using CAS (compare-and-swap).
+    ///
+    /// Fetches the current object, validates the expected version, applies the
+    /// mutation function, and attempts a single CAS write. Returns Conflict on
+    /// version mismatch for caller-driven retry.
+    ///
+    /// # Arguments
+    /// * `id` - Object ID to update
+    /// * `expected_version` - Required resource version for the update to proceed.
+    ///   Pass 0 to use the current version (internal operations only).
+    ///   For client-facing operations, pass the client-provided expected version.
+    /// * `mutate` - Function that modifies the object in place
+    ///
+    /// # Returns
+    /// * `Ok(T)` - Successfully updated object with new `resource_version`
+    /// * `Err(Conflict)` - Version mismatch; caller should retry
+    /// * `Err(Database)` - Object not found or other DB error
+    pub async fn update_message_cas<T, F>(
         &self,
         id: &str,
-        status: &str,
-        decided_at_ms: Option<i64>,
-    ) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
-                    .await
+        expected_version: u64,
+        mut mutate: F,
+    ) -> PersistenceResult<T>
+    where
+        T: Message
+            + Default
+            + ObjectType
+            + ObjectId
+            + ObjectName
+            + ObjectLabels
+            + ObjectWorkspace
+            + SetResourceVersion
+            + GetResourceVersion
+            + Clone,
+        F: FnMut(&mut T),
+    {
+        // Fetch current object with authoritative resource_version
+        let current = self
+            .get_message::<T>(id)
+            .await?
+            .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
+
+        let current_version = current.get_resource_version();
+
+        // Determine the version to use for CAS:
+        // - If expected_version is 0, use current version (internal operations)
+        // - Otherwise, validate that expected matches current (client-facing operations)
+        let cas_version = if expected_version == 0 {
+            current_version
+        } else {
+            if expected_version != current_version {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: Some(current_version),
+                });
             }
-            Self::Sqlite(store) => {
-                store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
-                    .await
-            }
-        }
-    }
+            expected_version
+        };
 
-    /// Update the proposed rule on a pending draft chunk.
-    pub async fn update_draft_chunk_rule(&self, id: &str, proposed_rule: &[u8]) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
-            Self::Sqlite(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
-        }
-    }
+        // Apply mutation
+        let mut updated = current.clone();
+        mutate(&mut updated);
 
-    /// Delete all draft chunks for a sandbox with a given status.
-    pub async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> Result<u64> {
-        match self {
-            Self::Postgres(store) => store.delete_draft_chunks(sandbox_id, status).await,
-            Self::Sqlite(store) => store.delete_draft_chunks(sandbox_id, status).await,
-        }
-    }
+        // Serialize labels
+        let labels_map = updated.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
 
-    /// Get the current maximum draft version for a sandbox.
-    pub async fn get_draft_version(&self, sandbox_id: &str) -> Result<i64> {
-        match self {
-            Self::Postgres(store) => store.get_draft_version(sandbox_id).await,
-            Self::Sqlite(store) => store.get_draft_version(sandbox_id).await,
+        if T::requires_workspace() && updated.object_workspace().is_empty() {
+            return Err(PersistenceError::Encode(format!(
+                "{} requires a non-empty workspace",
+                T::object_type(),
+            )));
         }
+
+        if updated.object_name() != current.object_name() {
+            return Err(PersistenceError::Encode(format!(
+                "{} name cannot be changed after creation",
+                T::object_type(),
+            )));
+        }
+
+        if updated.object_workspace() != current.object_workspace() {
+            return Err(PersistenceError::Encode(format!(
+                "{} workspace cannot be changed after creation",
+                T::object_type(),
+            )));
+        }
+
+        // Single-attempt CAS write - fails with Conflict on version mismatch
+        let result = self
+            .put_if(
+                T::object_type(),
+                updated.object_id(),
+                updated.object_name(),
+                updated.object_workspace(),
+                &updated.encode_to_vec(),
+                labels_json.as_deref(),
+                WriteCondition::MatchResourceVersion(cas_version),
+            )
+            .await?;
+
+        // Success - hydrate the new resource_version and return
+        updated.set_resource_version(result.resource_version);
+        Ok(updated)
     }
 }
 
-/// Stored draft policy chunk record.
-#[derive(Debug, Clone)]
-pub struct DraftChunkRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub draft_version: i64,
-    pub status: String,
-    pub rule_name: String,
-    pub proposed_rule: Vec<u8>,
-    pub rationale: String,
-    pub security_notes: String,
-    pub confidence: f64,
-    pub created_at_ms: i64,
-    pub decided_at_ms: Option<i64>,
-    /// Denormalized endpoint host (lowercase) for DB-level dedup.
-    pub host: String,
-    /// Denormalized endpoint port for DB-level dedup.
-    pub port: i32,
-    /// Binary path that triggered the denial (for per-binary dedup).
-    pub binary: String,
-    /// How many times this endpoint has been seen across denial flush cycles.
-    pub hit_count: i32,
-    /// First time this endpoint was proposed (ms since epoch).
-    pub first_seen_ms: i64,
-    /// Most recent time this endpoint was re-proposed (ms since epoch).
-    pub last_seen_ms: i64,
+pub fn current_time_ms() -> i64 {
+    openshell_core::time::now_ms()
 }
 
-fn current_time_ms() -> Result<i64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::execution(format!("time error: {e}")))?;
-    i64::try_from(now.as_millis())
-        .map_err(|e| Error::execution(format!("time conversion error: {e}")))
+fn map_db_error(error: &sqlx::Error) -> PersistenceError {
+    if let sqlx::Error::Database(db) = error
+        && db.is_unique_violation()
+    {
+        let constraint = db
+            .constraint()
+            .map(ToString::to_string)
+            .or_else(|| infer_sqlite_unique_constraint(db.message()));
+        return PersistenceError::unique_violation(constraint, Some(db.message().to_string()));
+    }
+    PersistenceError::Database(error.to_string())
 }
 
-fn map_db_error(error: &sqlx::Error) -> Error {
-    Error::execution(format!("database error: {error}"))
+fn infer_sqlite_unique_constraint(message: &str) -> Option<String> {
+    if message.contains("objects.object_type, objects.scope, objects.version") {
+        Some("objects_version_uq".to_string())
+    } else if message.contains("objects.object_type, objects.scope, objects.dedup_key") {
+        Some("objects_dedup_uq".to_string())
+    } else if message.contains("objects.object_type, objects.workspace, objects.name") {
+        Some("objects_name_uq".to_string())
+    } else if message.contains("objects.id") {
+        Some("objects_pkey".to_string())
+    } else {
+        None
+    }
 }
 
-fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> Error {
-    Error::execution(format!("migration error: {error}"))
+fn map_migrate_error(error: &sqlx::migrate::MigrateError) -> PersistenceError {
+    PersistenceError::Migration(error.to_string())
+}
+
+/// Parse a simple label selector string into key-value pairs.
+/// Format: "key1=value1,key2=value2"
+/// Returns a `HashMap` of label requirements.
+///
+/// Note: Input validation should be performed at the gRPC layer using
+/// `grpc::validation::validate_label_selector()` before calling this function.
+/// Errors returned here indicate unexpected internal errors, not user input errors.
+pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String, String>> {
+    if selector.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut labels = HashMap::new();
+    for pair in selector.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = pair.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            return Err(PersistenceError::Decode(format!(
+                "invalid label selector: expected 'key=value', got '{pair}'"
+            )));
+        }
+
+        let key = parts[0].trim();
+        let value = parts[1].trim();
+
+        if key.is_empty() {
+            return Err(PersistenceError::Decode(format!(
+                "invalid label selector: key cannot be empty in '{pair}'"
+            )));
+        }
+
+        labels.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(labels)
+}
+
+/// Unconditional write helpers — test-only.
+///
+/// Production code must use [`Store::put_if`] (with [`WriteCondition`]) or
+/// [`Store::update_message_cas`] to ensure every write is CAS-protected.
+#[cfg(test)]
+impl Store {
+    pub async fn put(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<()> {
+        store_dispatch!(self.put(object_type, id, name, workspace, payload, labels))
+    }
+
+    pub async fn put_message<
+        T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels + ObjectWorkspace,
+    >(
+        &self,
+        message: &T,
+    ) -> PersistenceResult<()> {
+        if T::requires_workspace() && message.object_workspace().is_empty() {
+            return Err(PersistenceError::Encode(format!(
+                "{} requires a non-empty workspace",
+                T::object_type(),
+            )));
+        }
+        let labels_map = message.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
+        self.put(
+            T::object_type(),
+            message.object_id(),
+            message.object_name(),
+            message.object_workspace(),
+            &message.encode_to_vec(),
+            labels_json.as_deref(),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+pub async fn test_store() -> Store {
+    Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .expect("in-memory SQLite store should connect")
 }
 
 #[cfg(test)]

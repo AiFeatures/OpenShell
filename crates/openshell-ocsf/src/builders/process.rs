@@ -43,38 +43,8 @@ impl<'a> ProcessActivityBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
     pub fn process(mut self, proc: Process) -> Self {
         self.process = Some(proc);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
         self
     }
     #[must_use]
@@ -85,11 +55,6 @@ impl<'a> ProcessActivityBuilder<'a> {
     #[must_use]
     pub fn exit_code(mut self, code: i32) -> Self {
         self.exit_code = Some(code);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
         self
     }
 
@@ -107,14 +72,8 @@ impl<'a> ProcessActivityBuilder<'a> {
             self.ctx
                 .metadata(&["security_control", "container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base,
@@ -127,6 +86,11 @@ impl<'a> ProcessActivityBuilder<'a> {
         })
     }
 }
+
+impl_activity_setter!(ProcessActivityBuilder);
+impl_action_disposition_setters!(ProcessActivityBuilder);
+impl_actor_process_setter!(ProcessActivityBuilder);
+impl_builder_setters!(ProcessActivityBuilder);
 
 #[cfg(test)]
 mod tests {

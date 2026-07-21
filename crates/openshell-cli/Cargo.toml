@@ -16,22 +16,23 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
-openshell-prover = { path = "../openshell-prover" }
 openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = { workspace = true }
 prost-types = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
 
 # gRPC client
-tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
 
 # CLI
+chrono = "0.4"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
@@ -44,10 +45,11 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring", "webpki-tokio"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+tower = { workspace = true }
 reqwest = { workspace = true }
 
 # Error handling
@@ -57,12 +59,18 @@ anyhow = { workspace = true }
 
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
+tempfile = "3"
+
+# OIDC/Auth
+oauth2 = "5"
+base64 = { workspace = true }
 
 # WebSocket (Cloudflare tunnel proxy)
 tokio-tungstenite = { workspace = true }
 
 # Streams
 futures = { workspace = true }
+tokio-stream = { workspace = true }
 nix = { workspace = true }
 
 # URL parsing
@@ -75,16 +83,11 @@ tracing-subscriber = { workspace = true }
 [lints]
 workspace = true
 
-[features]
-bundled-z3 = ["openshell-prover/bundled-z3"]
-dev-settings = ["openshell-core/dev-settings"]
-
 [dev-dependencies]
 futures = { workspace = true }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 temp-env = "0.3"
-tempfile = "3"
 tokio-stream = { workspace = true }
 url = { workspace = true }

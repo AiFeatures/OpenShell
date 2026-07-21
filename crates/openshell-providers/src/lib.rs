@@ -5,6 +5,7 @@
 
 mod context;
 mod discovery;
+mod profiles;
 mod providers;
 #[cfg(test)]
 mod test_helpers;
@@ -15,12 +16,25 @@ use std::path::Path;
 pub use openshell_core::proto::Provider;
 
 pub use context::{DiscoveryContext, RealDiscoveryContext};
-pub use discovery::discover_with_spec;
+pub use discovery::{discover_from_profile, discover_with_spec};
+pub use profiles::{
+    CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
+    builtin_profiles, is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json,
+    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    strategy_output_env_key, strategy_output_spec, strategy_primary_env_key, validate_profile_set,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
+    #[error(
+        "provider profile '{profile_id}' discovery references unknown credential '{credential_name}'"
+    )]
+    UnknownDiscoveryCredential {
+        profile_id: String,
+        credential_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,12 +71,30 @@ pub trait ProviderPlugin: Send + Sync {
         &[]
     }
 
-    /// Apply provider data to sandbox runtime context.
+    /// Inject provider-specific environment variables into the sandbox env.
     ///
-    /// Default implementation is a no-op; provider-specific runtime projection
-    /// can be layered in incrementally.
-    fn apply_to_sandbox(&self, _provider: &Provider) -> Result<(), ProviderError> {
-        Ok(())
+    /// Called during sandbox creation to project provider config (project IDs,
+    /// regions, SDK flags) into env vars the sandbox process will inherit.
+    /// Default is a no-op; GCP and Vertex providers override this.
+    fn inject_env(&self, _provider: &Provider, _env: &mut HashMap<String, String>) {}
+}
+
+/// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
+///
+/// Providers that only need standard env-var discovery can register their
+/// `SPEC` constant directly, instead of defining a dedicated struct and
+/// repeating the same three-method delegation.
+impl ProviderPlugin for ProviderDiscoverySpec {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
+        discover_with_spec(self, &RealDiscoveryContext)
+    }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        self.credential_env_vars
     }
 }
 
@@ -75,17 +107,20 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(providers::claude::ClaudeProvider);
-        registry.register(providers::codex::CodexProvider);
-        registry.register(providers::copilot::CopilotProvider);
+        registry.register(providers::claude::SPEC);
+        registry.register(providers::codex::SPEC);
+        registry.register(providers::copilot::SPEC);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
-        registry.register(providers::openai::OpenaiProvider);
-        registry.register(providers::anthropic::AnthropicProvider);
-        registry.register(providers::nvidia::NvidiaProvider);
-        registry.register(providers::gitlab::GitlabProvider);
-        registry.register(providers::github::GithubProvider);
+        registry.register(providers::openai::SPEC);
+        registry.register(providers::anthropic::SPEC);
+        registry.register(providers::nvidia::SPEC);
+        registry.register(providers::deepinfra::SPEC);
+        registry.register(providers::github::SPEC);
+        registry.register(providers::gitlab::SPEC);
+        registry.register(providers::google_cloud::GoogleCloudProvider);
         registry.register(providers::outlook::OutlookProvider);
+        registry.register(providers::vertex::VertexProvider);
         registry
     }
 
@@ -116,6 +151,32 @@ impl ProviderRegistry {
     }
 
     #[must_use]
+    pub fn profile(&self, id: &str) -> Option<&'static ProviderTypeProfile> {
+        builtin_profiles()
+            .iter()
+            .find(|profile| profile.id.eq_ignore_ascii_case(id))
+    }
+
+    #[must_use]
+    pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
+        builtin_profiles().iter().collect()
+    }
+
+    /// Inject provider-specific env vars via the registered plugin.
+    ///
+    /// Normalizes the provider type and delegates to the plugin's `inject_env`.
+    /// No-op if the provider type has no registered plugin or the plugin's
+    /// default implementation is a no-op.
+    pub fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
+        let normalized = normalize_provider_type(&provider.r#type);
+        if let Some(id) = normalized
+            && let Some(plugin) = self.get(id)
+        {
+            plugin.inject_env(provider, env);
+        }
+    }
+
+    #[must_use]
     pub fn known_types(&self) -> Vec<&'static str> {
         let mut types = self.plugins.keys().copied().collect::<Vec<_>>();
         types.sort_unstable();
@@ -125,16 +186,19 @@ impl ProviderRegistry {
 
 #[must_use]
 pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
+    // Inference provider aliases are canonicalized in openshell-core so that
+    // openshell-server and openshell-providers agree on the same mapping.
+    if let Some(canonical) = openshell_core::inference::normalize_inference_provider_type(input) {
+        return Some(canonical);
+    }
     let normalized = input.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "claude" => Some("claude"),
+        "claude" | "claude-code" | "claude_code" => Some("claude-code"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
+        "gcp" | "google-cloud" => Some("google-cloud"),
         "generic" => Some("generic"),
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
         "outlook" => Some("outlook"),
@@ -161,12 +225,22 @@ mod tests {
         assert_eq!(normalize_provider_type("gitlab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("gh"), Some("github"));
-        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude"));
+        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
+        assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
         assert_eq!(normalize_provider_type("generic"), Some("generic"));
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
         assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
+        assert_eq!(
+            normalize_provider_type("google-vertex-ai"),
+            Some("google-vertex-ai")
+        );
+        assert_eq!(normalize_provider_type("vertex"), Some("google-vertex-ai"));
+        assert_eq!(
+            normalize_provider_type("vertex-ai"),
+            Some("google-vertex-ai")
+        );
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 
@@ -174,7 +248,7 @@ mod tests {
     fn detects_provider_from_command_token() {
         assert_eq!(
             detect_provider_from_command(&["claude".to_string()]),
-            Some("claude")
+            Some("claude-code")
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/bin/glab".to_string()]),

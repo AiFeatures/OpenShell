@@ -23,6 +23,8 @@
 //! The WS tunnel handler is kept standalone so it stays isolated from the full
 //! `ServerState` dependency while still matching the production bridge logic.
 
+mod common;
+
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::Message},
@@ -30,6 +32,7 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
+use common::TestOpenShell;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
@@ -38,270 +41,15 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use openshell_core::proto::{
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxesRequest, ListSandboxesResponse, ProviderResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_client::OpenShellClient,
-    open_shell_server::{OpenShell, OpenShellServer},
+    HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
+    open_shell_server::OpenShellServer,
 };
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::{MultiplexedService, Store, health_router};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite;
-use tonic::{Response, Status};
-
-// ---------------------------------------------------------------------------
-// Minimal OpenShell implementation (same as other integration tests)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-struct TestOpenShell;
-
-#[tonic::async_trait]
-impl OpenShell for TestOpenShell {
-    async fn health(
-        &self,
-        _request: tonic::Request<HealthRequest>,
-    ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: ServiceStatus::Healthy.into(),
-            version: "test".to_string(),
-        }))
-    }
-
-    async fn create_sandbox(
-        &self,
-        _request: tonic::Request<CreateSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn get_sandbox(
-        &self,
-        _request: tonic::Request<GetSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn list_sandboxes(
-        &self,
-        _request: tonic::Request<ListSandboxesRequest>,
-    ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
-    }
-
-    async fn delete_sandbox(
-        &self,
-        _request: tonic::Request<DeleteSandboxRequest>,
-    ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
-    }
-
-    async fn get_sandbox_config(
-        &self,
-        _request: tonic::Request<GetSandboxConfigRequest>,
-    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
-    }
-
-    async fn get_gateway_config(
-        &self,
-        _request: tonic::Request<GetGatewayConfigRequest>,
-    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
-    }
-
-    async fn create_ssh_session(
-        &self,
-        _request: tonic::Request<CreateSshSessionRequest>,
-    ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        Ok(Response::new(CreateSshSessionResponse::default()))
-    }
-
-    async fn revoke_ssh_session(
-        &self,
-        _request: tonic::Request<RevokeSshSessionRequest>,
-    ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        Ok(Response::new(RevokeSshSessionResponse::default()))
-    }
-
-    async fn create_provider(
-        &self,
-        _request: tonic::Request<CreateProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_provider(
-        &self,
-        _request: tonic::Request<GetProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_providers(
-        &self,
-        _request: tonic::Request<ListProvidersRequest>,
-    ) -> Result<Response<ListProvidersResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_provider(
-        &self,
-        _request: tonic::Request<UpdateProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_provider(
-        &self,
-        _request: tonic::Request<DeleteProviderRequest>,
-    ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
-    type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
-
-    async fn watch_sandbox(
-        &self,
-        _request: tonic::Request<WatchSandboxRequest>,
-    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn exec_sandbox(
-        &self,
-        _request: tonic::Request<ExecSandboxRequest>,
-    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn update_config(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_sandbox_policies(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_logs(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn push_sandbox_logs(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn submit_policy_analysis(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_policy(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn reject_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_all_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn edit_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn undo_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn clear_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_history(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Test WS tunnel handler (standalone, no ServerState dependency)
@@ -420,9 +168,8 @@ where
                     break;
                 }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Err(_) => break,
         }
     }
     let _ = writer.shutdown().await;
@@ -543,7 +290,7 @@ async fn start_grpc_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service = health_router(test_health_store().await);
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let handle = tokio::spawn(async move {
@@ -571,7 +318,7 @@ async fn start_ws_tunnel_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service = health_router(test_health_store().await);
     let app = test_ws_tunnel_router(MultiplexedService::new(grpc_service, http_service));
 
     let handle = tokio::spawn(async move {
@@ -800,4 +547,14 @@ async fn ws_tunnel_graceful_close() {
     }
 
     stack.abort();
+}
+
+/// Build an in-memory store sufficient for wiring `health_router` in tests
+/// where the persistence layer itself is not under test.
+async fn test_health_store() -> Arc<Store> {
+    Arc::new(
+        Store::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite store for tests"),
+    )
 }

@@ -1,19 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::result_large_err)] // gRPC handlers return Result<_, tonic::Status>
+
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, ResolveSandboxEndpointRequest,
-    ResolveSandboxEndpointResponse, StopSandboxRequest, StopSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
     WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
-use crate::{KubernetesComputeDriver, KubernetesDriverError};
+use crate::KubernetesComputeDriver;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -35,7 +36,6 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.driver
             .capabilities()
-            .await
             .map(Response::new)
             .map_err(Status::internal)
     }
@@ -57,22 +57,16 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let request = request.into_inner();
-        if request.sandbox_name.is_empty() {
-            return Err(Status::invalid_argument("sandbox_name is required"));
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
         }
 
         let sandbox = self
             .driver
-            .get_sandbox(&request.sandbox_name)
+            .get_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
-            return Err(Status::failed_precondition(
-                "sandbox_id did not match the fetched sandbox",
-            ));
-        }
 
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
@@ -102,7 +96,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .create_sandbox(&sandbox)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -120,27 +114,15 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
         let deleted = self
             .driver
-            .delete_sandbox(&request.sandbox_name)
+            .delete_sandbox(&request.sandbox_id)
             .await
             .map_err(Status::internal)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
-    }
-
-    async fn resolve_sandbox_endpoint(
-        &self,
-        request: Request<ResolveSandboxEndpointRequest>,
-    ) -> Result<Response<ResolveSandboxEndpointResponse>, Status> {
-        let sandbox = request
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.driver
-            .resolve_sandbox_endpoint(&sandbox)
-            .await
-            .map(Response::new)
-            .map_err(status_from_driver_error)
     }
 
     type WatchSandboxesStream =
@@ -160,25 +142,28 @@ impl ComputeDriver for ComputeDriverService {
     }
 }
 
-fn status_from_driver_error(err: KubernetesDriverError) -> Status {
-    match err {
-        KubernetesDriverError::AlreadyExists => Status::already_exists("sandbox already exists"),
-        KubernetesDriverError::Precondition(message) => Status::failed_precondition(message),
-        KubernetesDriverError::Message(message) => Status::internal(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::KubernetesDriverError;
+    use openshell_core::ComputeDriverError;
+    use tonic::Status;
 
     #[test]
     fn precondition_driver_errors_map_to_failed_precondition_status() {
-        let status = status_from_driver_error(KubernetesDriverError::Precondition(
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::Precondition(
             "sandbox agent pod IP is not available".to_string(),
-        ));
+        ))
+        .into();
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox agent pod IP is not available");
+    }
+
+    #[test]
+    fn already_exists_driver_errors_map_to_already_exists_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::AlreadyExists).into();
+
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert_eq!(status.message(), "sandbox already exists");
     }
 }

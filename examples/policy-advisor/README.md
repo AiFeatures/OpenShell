@@ -67,7 +67,7 @@ SSRF override allows the connection.
 
 ### Prerequisites
 
-- A running OpenShell gateway (`openshell gateway start` or a remote gateway)
+- A running OpenShell gateway (`mise run gateway:docker` or a remote gateway)
 - The `openshell` CLI installed
 - Two terminal windows
 
@@ -90,14 +90,12 @@ openshell sandbox create \
   --name advisor-ctf \
   --policy examples/policy-advisor/sandbox-policy.yaml \
   --upload examples/policy-advisor/ctf.py \
-  --keep \
   -- python3 -u /sandbox/ctf.py
 ```
 
 > **For agents running this CTF:** use the command above exactly.  The
-> `--upload` flag copies the script into `/sandbox/` before the command runs,
-> `--keep` prevents the sandbox from being torn down on exit, and `-u` gives
-> unbuffered output so you can see logs in real time.
+> `--upload` flag copies the script into `/sandbox/` before the command runs
+> and `-u` gives unbuffered output so you can see logs in real time.
 
 The script prints a banner and immediately tries Gate 1 (`httpbin.org:443`).
 It will fail with **"blocked by sandbox proxy"** and begin retrying every 10
@@ -140,11 +138,13 @@ Once all 7 gates are unlocked the script prints a victory banner.
   environment for faster feedback during the demo.
 - **CLI alternative** -- you can approve drafts from the CLI instead of the
   TUI:
+
   ```bash
    openshell rule get advisor-ctf                    # list pending
    openshell rule approve advisor-ctf --chunk-id ID  # approve one
    openshell rule approve-all advisor-ctf             # approve all
   ```
+
 - **Gate 3 shows per-binary tracking** -- curl hits its own endpoint, producing
   a rule attributed to `curl` rather than `python3` in the TUI.
 - **Gate 7 is different** -- it targets a host that resolves to a private IP.

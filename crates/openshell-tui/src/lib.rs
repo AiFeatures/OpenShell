@@ -7,6 +7,7 @@ mod event;
 pub mod theme;
 mod ui;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,6 +18,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
+use openshell_bootstrap::list_gateways_with_source;
+use openshell_core::auth::EdgeAuthInterceptor;
+use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName, ObjectWorkspace};
+use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -32,15 +37,17 @@ const SPLASH_DURATION: Duration = Duration::from_secs(3);
 // Re-export for use by the CLI crate.
 pub use theme::ThemeMode;
 
-/// Launch the OpenShell TUI.
+/// Launch the `OpenShell` TUI.
 ///
-/// `channel` must be a connected gRPC channel to the OpenShell gateway.
+/// `channel` must be a connected gRPC channel to the `OpenShell` gateway.
 /// `theme_mode` selects the color theme: `Auto` detects the terminal
 /// background, `Dark`/`Light` forces a specific palette.
 pub async fn run(
     channel: Channel,
+    interceptor: EdgeAuthInterceptor,
     gateway_name: &str,
     endpoint: &str,
+    workspace: &str,
     theme_mode: ThemeMode,
 ) -> Result<()> {
     // Detect theme *before* entering raw/alternate-screen mode.
@@ -48,11 +55,12 @@ pub async fn run(
     // after our own enable_raw_mode() would conflict.
     let detected_theme = theme::detect(theme_mode);
 
-    let client = OpenShellClient::new(channel);
+    let client = OpenShellClient::with_interceptor(channel, interceptor);
     let mut app = App::new(
         client,
         gateway_name.to_string(),
         endpoint.to_string(),
+        workspace.to_string(),
         detected_theme,
     );
 
@@ -136,8 +144,7 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &events).await;
-                    refresh_data(&mut app).await;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
                 }
                 // --- Draft actions ---
                 if app.pending_draft_approve {
@@ -152,6 +159,11 @@ pub async fn run(
                     app.pending_draft_approve_all = false;
                     let snapshot = std::mem::take(&mut app.approve_all_confirm_chunks);
                     spawn_draft_approve_all(&app, snapshot, events.sender());
+                }
+                if app.pending_workspace_refresh {
+                    app.pending_workspace_refresh = false;
+                    refresh_providers(&mut app).await;
+                    refresh_sandboxes(&mut app).await;
                 }
             }
             Some(Event::LogLines(lines)) => {
@@ -181,23 +193,7 @@ pub async fn run(
             }
             Some(Event::ProviderDetailFetched(result)) => match result {
                 Ok(provider) => {
-                    let cred_key = provider
-                        .credentials
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_default();
-                    let masked = if let Some(val) = provider.credentials.values().next() {
-                        mask_secret(val)
-                    } else {
-                        "-".to_string()
-                    };
-                    app.provider_detail = Some(app::ProviderDetailView {
-                        name: provider.name.clone(),
-                        provider_type: provider.r#type.clone(),
-                        credential_key: cred_key,
-                        masked_value: masked,
-                    });
+                    app.provider_detail = Some(app.provider_detail_from_provider(&provider));
                 }
                 Err(msg) => {
                     app.status_text = format!("get provider failed: {msg}");
@@ -245,7 +241,7 @@ pub async fn run(
                     app.apply_global_settings(settings, revision);
                 }
                 Err(msg) => {
-                    tracing::warn!("failed to fetch global settings: {msg}");
+                    app.status_text = format!("failed to fetch global settings: {msg}");
                 }
             },
             Some(Event::GlobalSettingSetResult(result)) => {
@@ -295,6 +291,9 @@ pub async fn run(
                 }
                 fetch_sandbox_detail(&mut app).await;
             }
+            Some(Event::ForwardWarnings(warnings)) => {
+                app.status_text = format!("port forward issues: {}", warnings.join("; "));
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -312,12 +311,11 @@ pub async fn run(
             },
             Some(Event::Tick) => {
                 // Auto-dismiss splash after SPLASH_DURATION.
-                if app.screen == Screen::Splash {
-                    if let Some(start) = app.splash_start {
-                        if start.elapsed() >= SPLASH_DURATION {
-                            app.dismiss_splash();
-                        }
-                    }
+                if app.screen == Screen::Splash
+                    && let Some(start) = app.splash_start
+                    && start.elapsed() >= SPLASH_DURATION
+                {
+                    app.dismiss_splash();
                 }
 
                 refresh_gateway_list(&mut app);
@@ -337,90 +335,91 @@ pub async fn run(
             }
             Some(Event::Redraw) => {
                 // Check if a buffered sandbox CreateResult is ready to finalize.
-                if let Some(form) = app.create_form.as_ref() {
-                    if form.create_result.is_some() {
-                        let elapsed = form
-                            .anim_start
-                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
-                        if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app
-                                .create_form
-                                .as_mut()
-                                .and_then(|f| f.create_result.take());
-                            if let Some(h) = app.anim_handle.take() {
-                                h.abort();
-                            }
-                            match result {
-                                Some(Ok(name)) => {
-                                    app.create_form = None;
-                                    let ports = std::mem::take(&mut app.pending_forward_ports);
-                                    let command = std::mem::take(&mut app.pending_exec_command);
-                                    let port_info = if ports.is_empty() {
-                                        String::new()
-                                    } else {
-                                        let list = ports
-                                            .iter()
-                                            .map(|p| p.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        format!(" (forwarding port(s) {list})")
-                                    };
-                                    app.status_text = format!("Created sandbox: {name}{port_info}");
-                                    refresh_sandboxes(&mut app).await;
+                if let Some(form) = app.create_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok((name, create_workspace))) => {
+                                app.create_form = None;
+                                let ports = std::mem::take(&mut app.pending_forward_ports);
+                                let command = std::mem::take(&mut app.pending_exec_command);
+                                let port_info = if ports.is_empty() {
+                                    String::new()
+                                } else {
+                                    let list = ports
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    format!(" (forwarding port(s) {list})")
+                                };
+                                app.status_text = format!("Created sandbox: {name}{port_info}");
+                                refresh_sandboxes(&mut app).await;
 
-                                    // If a command was specified, suspend TUI and exec it.
-                                    if !command.is_empty() {
-                                        handle_exec_command(
-                                            &mut app,
-                                            &mut terminal,
-                                            &events,
-                                            &name,
-                                            &command,
-                                        )
-                                        .await;
-                                    }
+                                // If a command was specified, suspend TUI and exec it.
+                                if !command.is_empty() {
+                                    handle_exec_command(
+                                        &mut app,
+                                        &mut terminal,
+                                        &mut events,
+                                        &name,
+                                        &command,
+                                        &create_workspace,
+                                    )
+                                    .await?;
                                 }
-                                Some(Err(msg)) => {
-                                    if let Some(form) = app.create_form.as_mut() {
-                                        form.phase = app::CreatePhase::Form;
-                                        form.anim_start = None;
-                                        form.status = Some(format!("Create failed: {msg}"));
-                                    }
-                                }
-                                None => {}
                             }
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_form.as_mut() {
+                                    form.phase = app::CreatePhase::Form;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
                 // Check if a buffered provider CreateResult is ready to finalize.
-                if let Some(form) = app.create_provider_form.as_ref() {
-                    if form.create_result.is_some() {
-                        let elapsed = form
-                            .anim_start
-                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
-                        if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app
-                                .create_provider_form
-                                .as_mut()
-                                .and_then(|f| f.create_result.take());
-                            if let Some(h) = app.anim_handle.take() {
-                                h.abort();
+                if let Some(form) = app.create_provider_form.as_ref()
+                    && form.create_result.is_some()
+                {
+                    let elapsed = form
+                        .anim_start
+                        .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
+                    if elapsed >= app::MIN_CREATING_DISPLAY {
+                        let result = app
+                            .create_provider_form
+                            .as_mut()
+                            .and_then(|f| f.create_result.take());
+                        if let Some(h) = app.anim_handle.take() {
+                            h.abort();
+                        }
+                        match result {
+                            Some(Ok(name)) => {
+                                app.create_provider_form = None;
+                                app.status_text = format!("Created provider: {name}");
+                                refresh_providers(&mut app).await;
                             }
-                            match result {
-                                Some(Ok(name)) => {
-                                    app.create_provider_form = None;
-                                    app.status_text = format!("Created provider: {name}");
-                                    refresh_providers(&mut app).await;
+                            Some(Err(msg)) => {
+                                if let Some(form) = app.create_provider_form.as_mut() {
+                                    form.phase = app::CreateProviderPhase::EnterKey;
+                                    form.anim_start = None;
+                                    form.status = Some(format!("Create failed: {msg}"));
                                 }
-                                Some(Err(msg)) => {
-                                    if let Some(form) = app.create_provider_form.as_mut() {
-                                        form.phase = app::CreateProviderPhase::EnterKey;
-                                        form.anim_start = None;
-                                        form.status = Some(format!("Create failed: {msg}"));
-                                    }
-                                }
-                                None => {}
                             }
+                            None => {}
                         }
                     }
                 }
@@ -452,13 +451,14 @@ pub async fn run(
 
 /// Refresh the list of known gateways from disk.
 fn refresh_gateway_list(app: &mut App) {
-    if let Ok(gateways) = openshell_bootstrap::list_gateways() {
+    if let Ok(gateways) = list_gateways_with_source() {
         app.gateways = gateways
             .into_iter()
             .map(|m| GatewayEntry {
-                name: m.name,
-                endpoint: m.gateway_endpoint,
-                is_remote: m.is_remote,
+                source: Some(m.source),
+                name: m.metadata.name,
+                endpoint: m.metadata.gateway_endpoint,
+                is_remote: m.metadata.is_remote,
             })
             .collect();
 
@@ -490,8 +490,8 @@ async fn handle_gateway_switch(app: &mut App) {
     };
 
     match connect_to_gateway(&name, &endpoint).await {
-        Ok(channel) => {
-            app.client = OpenShellClient::new(channel);
+        Ok((channel, interceptor)) => {
+            app.client = OpenShellClient::with_interceptor(channel, interceptor);
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
@@ -504,8 +504,76 @@ async fn handle_gateway_switch(app: &mut App) {
     }
 }
 
-/// Build a gRPC channel to a gateway using its mTLS certs on disk.
-async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
+/// Build a gRPC channel and auth interceptor for a gateway.
+///
+/// Checks gateway metadata for the auth mode and loads the appropriate
+/// credentials (mTLS certs or OIDC bearer token).
+async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, EdgeAuthInterceptor)> {
+    let meta = openshell_bootstrap::get_gateway_metadata(name);
+
+    if meta.as_ref().and_then(|m| m.auth_mode.as_deref()) == Some("oidc") {
+        let bundle = openshell_bootstrap::oidc_token::load_oidc_token(name).ok_or_else(|| {
+            miette::miette!(
+                "No OIDC token for gateway '{name}'.\n\
+                     Authenticate with: openshell gateway login"
+            )
+        })?;
+        if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+            miette::bail!(
+                "OIDC token for gateway '{name}' has expired.\n\
+                 Re-authenticate with: openshell gateway login"
+            );
+        }
+        let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
+        let channel = build_oidc_channel(name, endpoint).await?;
+        Ok((channel, interceptor))
+    } else {
+        let channel = build_mtls_channel(name, endpoint).await?;
+        Ok((channel, EdgeAuthInterceptor::noop()))
+    }
+}
+
+/// Build an HTTPS channel for OIDC-authenticated gateways.
+///
+/// Tries mTLS client certs for the transport layer when available (the server
+/// may still require them alongside the bearer token), falls back to CA-only
+/// or system roots.
+async fn build_oidc_channel(name: &str, endpoint: &str) -> Result<Channel> {
+    let mtls_dir = gateway_mtls_dir(name);
+
+    let tls_config = mtls_dir.as_ref().map_or_else(
+        || ClientTlsConfig::new().with_enabled_roots(),
+        |dir| {
+            let ca = std::fs::read(dir.join("ca.crt")).ok();
+            let cert = std::fs::read(dir.join("tls.crt")).ok();
+            let key = std::fs::read(dir.join("tls.key")).ok();
+
+            match (ca, cert, key) {
+                (Some(ca), Some(cert), Some(key)) => ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(ca))
+                    .identity(Identity::from_pem(cert, key)),
+                (Some(ca), _, _) => {
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca))
+                }
+                _ => ClientTlsConfig::new().with_enabled_roots(),
+            }
+        },
+    );
+
+    Endpoint::from_shared(endpoint.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?
+        .connect()
+        .await
+        .into_diagnostic()
+}
+
+/// Build a gRPC channel using mTLS client certificates.
+async fn build_mtls_channel(name: &str, endpoint: &str) -> Result<Channel> {
     let mtls_dir = gateway_mtls_dir(name)
         .ok_or_else(|| miette::miette!("cannot determine config directory for gateway {name}"))?;
 
@@ -523,7 +591,7 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
         .ca_certificate(Certificate::from_pem(ca))
         .identity(Identity::from_pem(cert, key));
 
-    let channel = Endpoint::from_shared(endpoint.to_string())
+    Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
@@ -532,9 +600,7 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
         .into_diagnostic()?
         .connect()
         .await
-        .into_diagnostic()?;
-
-    Ok(channel)
+        .into_diagnostic()
 }
 
 /// Resolve the mTLS cert directory for a gateway.
@@ -567,6 +633,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     };
 
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     let handle = tokio::spawn(async move {
         // Phase 1: Fetch initial history via unary RPC.
@@ -576,6 +643,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             since_ms: 0,
             sources: vec![],
             min_level: String::new(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
@@ -593,7 +661,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     source: String::new(),
                     target: String::new(),
                     message: format!("Failed to fetch logs: {}", e.message()),
-                    fields: Default::default(),
+                    fields: HashMap::default(),
                 }]));
                 return;
             }
@@ -604,7 +672,7 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     source: String::new(),
                     target: String::new(),
                     message: "Timed out fetching logs.".into(),
-                    fields: Default::default(),
+                    fields: HashMap::default(),
                 }]));
                 return;
             }
@@ -620,24 +688,20 @@ fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             ..Default::default()
         };
 
-        let resp =
-            match tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(_)) | Err(_) => return, // Silently stop — user can re-enter logs.
-            };
+        // Silently stop — user can re-enter logs.
+        let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await
+        else {
+            return;
+        };
 
         let mut stream = resp.into_inner();
-        loop {
-            match stream.message().await {
-                Ok(Some(event)) => {
-                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
-                        event.payload
-                    {
-                        let line = proto_to_log_line(log);
-                        let _ = tx.send(Event::LogLines(vec![line]));
-                    }
-                }
-                _ => break, // Stream ended or error.
+        while let Ok(Some(event)) = stream.message().await {
+            if let Some(openshell_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                event.payload
+            {
+                let line = proto_to_log_line(log);
+                let _ = tx.send(Event::LogLines(vec![line]));
             }
         }
     });
@@ -670,13 +734,20 @@ async fn handle_sandbox_delete(app: &mut App) {
     };
 
     // Stop any active port forwards before deleting (mirrors CLI behavior).
-    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name) {
-        for port in &stopped {
-            tracing::info!("stopped forward of port {port} for sandbox {sandbox_name}");
-        }
+    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name)
+        && !stopped.is_empty()
+    {
+        let ports: Vec<String> = stopped.iter().map(ToString::to_string).collect();
+        app.status_text = format!(
+            "stopped port forwards [{}] for sandbox {sandbox_name}",
+            ports.join(", ")
+        );
     }
 
-    let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+    let req = openshell_core::proto::DeleteSandboxRequest {
+        name: sandbox_name,
+        workspace: app.selected_sandbox_workspace(),
+    };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
             app.cancel_log_stream();
@@ -708,6 +779,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     let req = openshell_core::proto::GetSandboxRequest {
         name: sandbox_name.clone(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
     // Step 1: Fetch sandbox metadata (providers, sandbox ID).
@@ -716,23 +788,20 @@ async fn fetch_sandbox_detail(app: &mut App) {
             Ok(Ok(resp)) => {
                 if let Some(sandbox) = resp.into_inner().sandbox {
                     if let Some(spec) = &sandbox.spec {
-                        app.sandbox_providers_list = spec.providers.clone();
+                        app.sandbox_providers_list.clone_from(&spec.providers);
                     }
-                    if sandbox.id.is_empty() {
-                        None
-                    } else {
-                        Some(sandbox.id)
-                    }
+                    let id = sandbox.object_id().to_string();
+                    if id.is_empty() { None } else { Some(id) }
                 } else {
                     None
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox detail: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox detail: {}", e.message());
                 None
             }
             Err(_) => {
-                tracing::warn!("sandbox detail request timed out");
+                app.status_text = "sandbox detail request timed out".to_string();
                 None
             }
         };
@@ -763,10 +832,10 @@ async fn fetch_sandbox_detail(app: &mut App) {
                 app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox policy: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox policy: {}", e.message());
             }
             Err(_) => {
-                tracing::warn!("sandbox policy request timed out");
+                app.status_text = "sandbox policy request timed out".to_string();
             }
         }
     }
@@ -785,33 +854,35 @@ async fn fetch_sandbox_detail(app: &mut App) {
 async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
-) {
+    events: &mut EventHandler,
+) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
-        None => return,
+        None => return Ok(()),
     };
 
     // Step 1: Get sandbox ID.
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.clone(),
+            workspace: app.selected_sandbox_workspace(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
-            Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.id,
-                None => {
+            Ok(Ok(resp)) => {
+                if let Some(s) = resp.into_inner().sandbox {
+                    s.object_id().to_string()
+                } else {
                     app.status_text = "sandbox not found".to_string();
-                    return;
+                    return Ok(());
                 }
-            },
+            }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -826,38 +897,40 @@ async fn handle_shell_connect(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "SSH session request timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("gateway returned invalid SSH session response: {err}");
+        return Ok(());
+    }
 
     // Step 3: Resolve gateway address (handle loopback override).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(&app.gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        &app.gateway_name,
     );
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
@@ -889,12 +962,13 @@ async fn handle_shell_connect(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 8: Spawn SSH as child process and wait.
     let status = tokio::task::spawn_blocking(move || command.status()).await;
@@ -913,15 +987,22 @@ async fn handle_shell_connect(
         }
     }
 
-    // Step 9: Resume TUI — re-enter alternate screen, enable raw mode, unpause events.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    // Step 9: Resume and draw the TUI before accepting new terminal input.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 /// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
@@ -932,30 +1013,33 @@ async fn handle_shell_connect(
 async fn handle_exec_command(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
+    events: &mut EventHandler,
     sandbox_name: &str,
     command: &str,
-) {
+    workspace: &str,
+) -> Result<()> {
     // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
             name: sandbox_name.to_string(),
+            workspace: workspace.to_string(),
         };
         match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
-            Ok(Ok(resp)) => match resp.into_inner().sandbox {
-                Some(s) => s.id,
-                None => {
+            Ok(Ok(resp)) => {
+                if let Some(s) = resp.into_inner().sandbox {
+                    s.object_id().to_string()
+                } else {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
-                    return;
+                    return Ok(());
                 }
-            },
+            }
             Ok(Err(e)) => {
                 app.status_text = format!("exec: failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -969,37 +1053,39 @@ async fn handle_exec_command(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("exec: SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: SSH session timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
+        return Ok(());
+    }
 
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("exec: failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(&app.gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        &app.gateway_name,
     );
 
     // Step 3: Build SSH command — same flags as handle_shell_connect but with
@@ -1007,7 +1093,7 @@ async fn handle_exec_command(
     // remote shell parses it correctly.
     let command_str = command
         .split_whitespace()
-        .map(|word| shell_escape(word))
+        .map(shell_escape)
         .collect::<Vec<_>>()
         .join(" ");
     let mut ssh = std::process::Command::new("ssh");
@@ -1037,12 +1123,13 @@ async fn handle_exec_command(
     events.pause();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 5: Run command — blocks until user Ctrl-C's or command exits.
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
@@ -1062,18 +1149,25 @@ async fn handle_exec_command(
     }
 
     // Step 6: Resume TUI.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    events.discard_pending();
     events.resume();
+
+    Ok(())
 }
 
 // SSH utility functions are shared via openshell_core::forward.
-use openshell_core::forward::{resolve_ssh_gateway, shell_escape};
+use openshell_core::forward::{
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response,
+};
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -1197,7 +1291,7 @@ fn render_policy_lines(
                         };
                         lines.push(Line::from(vec![
                             Span::styled("      Allow: ", t.muted),
-                            Span::styled(format!("{:<6} {}", method, target), t.text),
+                            Span::styled(format!("{method:<6} {target}"), t.text),
                         ]));
                     }
                 }
@@ -1265,11 +1359,12 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     // Stash command so we can exec after sandbox creation + Ready.
     app.pending_exec_command = command;
     // Stash ports so we can include them in the status text.
-    app.pending_forward_ports = ports.clone();
+    app.pending_forward_ports.clone_from(&ports);
 
     let endpoint = app.endpoint.clone();
     let gateway_name = app.gateway_name.clone();
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
+    let workspace = app.current_workspace.clone();
 
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
@@ -1301,14 +1396,24 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 policy,
                 ..Default::default()
             }),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace: workspace.clone(),
         };
 
         let sandbox_name =
             match tokio::time::timeout(Duration::from_secs(30), client.create_sandbox(req)).await {
-                Ok(Ok(resp)) => resp
-                    .into_inner()
-                    .sandbox
-                    .map_or_else(|| "unknown".to_string(), |s| s.name),
+                Ok(Ok(resp)) => resp.into_inner().sandbox.map_or_else(
+                    || "unknown".to_string(),
+                    |s| {
+                        let name = s.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    },
+                ),
                 Ok(Err(e)) => {
                     let _ = tx.send(Event::CreateResult(Err(e.message().to_string())));
                     return;
@@ -1334,28 +1439,27 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
                 let req = openshell_core::proto::GetSandboxRequest {
                     name: sandbox_name.clone(),
+                    workspace: workspace.clone(),
                 };
-                match client.get_sandbox(req).await {
-                    Ok(resp) => {
-                        if let Some(sandbox) = resp.into_inner().sandbox {
-                            if sandbox.phase == 2 {
-                                break sandbox.id;
-                            }
-                            if sandbox.phase == 3 {
-                                let _ = tx.send(Event::CreateResult(Err(
-                                    "sandbox entered error state".to_string(),
-                                )));
-                                return;
-                            }
-                        }
+                // Retry on transient errors.
+                if let Ok(resp) = client.get_sandbox(req).await
+                    && let Some(sandbox) = resp.into_inner().sandbox
+                {
+                    if sandbox.phase() == SandboxPhase::Ready as i32 {
+                        break sandbox.object_id().to_string();
                     }
-                    Err(_) => {} // Retry on transient errors.
+                    if sandbox.phase() == SandboxPhase::Error as i32 {
+                        let _ = tx.send(Event::CreateResult(Err(
+                            "sandbox entered error state".to_string()
+                        )));
+                        return;
+                    }
                 }
             };
 
             // Start port forwards if requested.
             if !ports.is_empty() {
-                start_port_forwards(
+                let forward_warnings = start_port_forwards(
                     &mut client,
                     &endpoint,
                     &gateway_name,
@@ -1364,10 +1468,13 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     &ports,
                 )
                 .await;
+                if !forward_warnings.is_empty() {
+                    let _ = tx.send(Event::ForwardWarnings(forward_warnings));
+                }
             }
         }
 
-        let _ = tx.send(Event::CreateResult(Ok(sandbox_name)));
+        let _ = tx.send(Event::CreateResult(Ok((sandbox_name, workspace))));
     });
 }
 
@@ -1376,13 +1483,17 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 /// This is called from within the create-sandbox task so the pacman animation
 /// keeps running while forwards are being established.
 async fn start_port_forwards(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut OpenShellClient<
+        tonic::service::interceptor::InterceptedService<Channel, EdgeAuthInterceptor>,
+    >,
     endpoint: &str,
     gateway_name: &str,
     sandbox_name: &str,
     sandbox_id: &str,
     specs: &[openshell_core::forward::ForwardSpec],
-) {
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
     // Create SSH session.
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
@@ -1391,39 +1502,43 @@ async fn start_port_forwards(
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
-                tracing::warn!("SSH session failed for forwards: {}", e.message());
-                return;
+                warnings.push(format!("SSH session failed for forwards: {}", e.message()));
+                return warnings;
             }
             Err(_) => {
-                tracing::warn!("SSH session timed out for forwards");
-                return;
+                warnings.push("SSH session timed out for forwards".to_string());
+                return warnings;
             }
         }
     };
+    if let Err(err) = validate_ssh_session_response(&session) {
+        warnings.push(format!(
+            "gateway returned invalid SSH session response for forwards: {err}"
+        ));
+        return warnings;
+    }
 
     // Resolve gateway address.
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("failed to find executable for forwards: {e}");
-            return;
+            warnings.push(format!("failed to find executable for forwards: {e}"));
+            return warnings;
         }
     };
-    let exe_str = shell_escape(&exe.to_string_lossy());
-    let gateway = shell_escape(gateway_name);
-    let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
-        session.sandbox_id, session.token,
+    let proxy_command = build_proxy_command(
+        &exe.to_string_lossy(),
+        &gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        gateway_name,
     );
 
     // Start a forward for each spec.
@@ -1495,16 +1610,18 @@ async fn start_port_forwards(
                 }
             }
             Ok(Ok(false)) => {
-                tracing::warn!("SSH forward exited with error for port {port_val}");
+                warnings.push(format!("SSH forward exited with error for port {port_val}"));
             }
             Ok(Err(e)) => {
-                tracing::warn!("forward failed for port {port_val}: {e}");
+                warnings.push(format!("forward failed for port {port_val}: {e}"));
             }
             Err(e) => {
-                tracing::warn!("forward task panicked for port {port_val}: {e}");
+                warnings.push(format!("forward task panicked for port {port_val}: {e}"));
             }
         }
     }
+
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1646,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         form.name.clone()
     };
     let credentials = form.discovered_credentials.clone().unwrap_or_default();
+    let workspace = app.current_workspace.clone();
 
     tokio::spawn(async move {
         // Try with the chosen name, retry with suffix on collision.
@@ -1541,17 +1659,35 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
             let req = openshell_core::proto::CreateProviderRequest {
                 provider: Some(openshell_core::proto::Provider {
-                    id: String::new(),
-                    name: provider_name.clone(),
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: provider_name.clone(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                        workspace: workspace.clone(),
+                        deletion_timestamp_ms: 0,
+                    }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
-                    config: Default::default(),
+                    config: HashMap::default(),
+                    credential_expires_at_ms: HashMap::default(),
+                    profile_workspace: workspace.clone(),
                 }),
+                workspace: workspace.clone(),
             };
 
             match client.create_provider(req).await {
                 Ok(resp) => {
-                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| p.name);
+                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| {
+                        let name = p.object_name().to_string();
+                        if name.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            name
+                        }
+                    });
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
@@ -1577,9 +1713,10 @@ fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::GetProviderRequest { name };
+        let req = openshell_core::proto::GetProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
             Ok(Ok(resp)) => {
                 if let Some(provider) = resp.into_inner().provider {
@@ -1613,19 +1750,32 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let ptype = form.provider_type.clone();
     let cred_key = form.credential_key.clone();
     let new_value = form.new_value.clone();
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let mut credentials = std::collections::HashMap::new();
+        let mut credentials = HashMap::new();
         credentials.insert(cred_key, new_value);
 
         let req = openshell_core::proto::UpdateProviderRequest {
             provider: Some(openshell_core::proto::Provider {
-                id: String::new(),
-                name: name.clone(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.clone(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.clone(),
+                    deletion_timestamp_ms: 0,
+                }),
                 r#type: ptype,
                 credentials,
-                config: Default::default(),
+                config: HashMap::default(),
+                credential_expires_at_ms: HashMap::default(),
+                profile_workspace: String::new(),
             }),
+            credential_expires_at_ms: HashMap::default(),
+            workspace,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1651,9 +1801,10 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_provider_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::DeleteProviderRequest { name };
+        let req = openshell_core::proto::DeleteProviderRequest { name, workspace };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
@@ -1690,9 +1841,14 @@ fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::ApproveDraftChunkRequest { name, chunk_id };
+        let req = openshell_core::proto::ApproveDraftChunkRequest {
+            name,
+            chunk_id,
+            workspace,
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
@@ -1729,12 +1885,14 @@ fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
         .draft_chunks
         .get(abs)
         .map_or_else(String::new, |c| c.rule_name.clone());
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         let req = openshell_core::proto::RejectDraftChunkRequest {
             name,
             chunk_id,
             reason: String::new(),
+            workspace,
         };
         match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
             Ok(Ok(_)) => {
@@ -1770,11 +1928,13 @@ fn spawn_draft_approve_all(
         Some(n) => n.to_string(),
         None => return,
     };
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         let req = openshell_core::proto::ApproveAllDraftChunksRequest {
             name,
             include_security_flagged: false,
+            workspace,
         };
         match tokio::time::timeout(
             Duration::from_secs(30),
@@ -1809,61 +1969,131 @@ fn spawn_draft_approve_all(
     });
 }
 
-/// Mask a secret value, showing only the first and last 2 chars.
-fn mask_secret(value: &str) -> String {
-    let len = value.len();
-    if len <= 6 {
-        "*".repeat(len)
-    } else {
-        let start: String = value.chars().take(2).collect();
-        let end: String = value.chars().skip(len - 2).collect();
-        format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Data refresh
 // ---------------------------------------------------------------------------
 
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
-    refresh_providers(app).await;
     refresh_global_settings(app).await;
+    refresh_workspaces(app).await;
+    refresh_providers(app).await;
     refresh_sandboxes(app).await;
+}
+
+async fn refresh_workspaces(app: &mut App) {
+    let req = openshell_core::proto::ListWorkspacesRequest {
+        limit: 100,
+        offset: 0,
+        label_selector: String::new(),
+    };
+    match tokio::time::timeout(Duration::from_secs(5), app.client.list_workspaces(req)).await {
+        Ok(Ok(resp)) => {
+            app.workspace_names = resp
+                .into_inner()
+                .workspaces
+                .into_iter()
+                .filter_map(|w| w.metadata.map(|m| m.name))
+                .collect();
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to list workspaces: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "list workspaces timed out".to_string();
+        }
+    }
 }
 
 async fn refresh_providers(app: &mut App) {
     let req = openshell_core::proto::ListProvidersRequest {
         limit: 100,
         offset: 0,
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
     };
-    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await;
-    match result {
-        Ok(Err(e)) => {
-            tracing::warn!("failed to list providers: {}", e.message());
-        }
-        Err(_) => {
-            tracing::warn!("list providers timed out");
-        }
-        Ok(Ok(resp)) => {
-            let providers = resp.into_inner().providers;
-            app.provider_count = providers.len();
-            app.provider_names = providers.iter().map(|p| p.name.clone()).collect();
-            app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
-            app.provider_cred_keys = providers
-                .iter()
-                .map(|p| {
-                    p.credentials
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_else(|| "-".to_string())
-                })
-                .collect();
-            if app.provider_selected >= app.provider_count && app.provider_count > 0 {
-                app.provider_selected = app.provider_count - 1;
+    let providers =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
+            Ok(Ok(resp)) => resp.into_inner().providers,
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list providers: {}", e.message());
+                return;
             }
-        }
+            Err(_) => {
+                app.status_text = "list providers timed out".to_string();
+                return;
+            }
+        };
+
+    let profiles: HashMap<(String, String), openshell_core::proto::ProviderProfile> =
+        if app.providers_v2_enabled {
+            let workspaces: std::collections::HashSet<String> = providers
+                .iter()
+                .map(|p| p.profile_workspace.clone())
+                .collect();
+            let mut all_profiles = HashMap::new();
+            for ws in &workspaces {
+                let req = openshell_core::proto::ListProviderProfilesRequest {
+                    limit: 100,
+                    offset: 0,
+                    workspace: ws.clone(),
+                };
+                if let Ok(Ok(resp)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    app.client.list_provider_profiles(req),
+                )
+                .await
+                {
+                    for profile in resp.into_inner().profiles {
+                        all_profiles.insert((ws.clone(), profile.id.clone()), profile);
+                    }
+                }
+            }
+            all_profiles
+        } else {
+            HashMap::new()
+        };
+
+    app.provider_count = providers.len();
+    app.provider_entries = if app.providers_v2_enabled {
+        providers
+            .iter()
+            .cloned()
+            .map(|provider| app::ProviderV2Entry {
+                profile: profiles
+                    .get(&(provider.profile_workspace.clone(), provider.r#type.clone()))
+                    .cloned(),
+                provider,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    app.provider_names = providers
+        .iter()
+        .map(|p| app::provider_name(p).to_string())
+        .collect();
+    app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
+    app.provider_cred_keys = providers
+        .iter()
+        .map(|p| {
+            p.credentials
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "-".to_string())
+        })
+        .collect();
+    app.provider_workspaces = providers
+        .iter()
+        .map(|p| p.object_workspace().to_string())
+        .collect();
+    if app.provider_selected >= app.provider_count && app.provider_count > 0 {
+        app.provider_selected = app.provider_count - 1;
     }
 }
 
@@ -1873,10 +2103,10 @@ async fn refresh_global_settings(app: &mut App) {
         tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to fetch global settings: {}", e.message());
+            app.status_text = format!("failed to fetch global settings: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("get gateway settings timed out");
+            app.status_text = "get gateway settings timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let inner = resp.into_inner();
@@ -1890,6 +2120,7 @@ async fn refresh_global_settings(app: &mut App) {
         limit: 1,
         offset: 0,
         global: true,
+        workspace: String::new(),
     };
     if let Ok(Ok(resp)) = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1929,25 +2160,25 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                match openshell_core::settings::parse_bool_like(&raw) {
-                    Some(v) => setting_value::Value::BoolValue(v),
-                    None => {
-                        let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
-                            "invalid bool value: {raw}"
-                        ))));
-                        return;
-                    }
+                if let Some(v) = openshell_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
                 }
             }
-            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
-                Ok(v) => setting_value::Value::IntValue(v),
-                Err(_) => {
+            openshell_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
                     let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
                         "invalid int value: {raw}"
                     ))));
                     return;
                 }
-            },
+            }
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
@@ -1955,11 +2186,11 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
             global: true,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -1989,11 +2220,11 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
             global: true,
+            workspace: String::new(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2025,31 +2256,32 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let raw = edit.input.trim().to_string();
     let kind = entry.kind;
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                match openshell_core::settings::parse_bool_like(&raw) {
-                    Some(v) => setting_value::Value::BoolValue(v),
-                    None => {
-                        let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
-                            "invalid bool value: {raw}"
-                        ))));
-                        return;
-                    }
+                if let Some(v) = openshell_core::settings::parse_bool_like(&raw) {
+                    setting_value::Value::BoolValue(v)
+                } else {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid bool value: {raw}"
+                    ))));
+                    return;
                 }
             }
-            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
-                Ok(v) => setting_value::Value::IntValue(v),
-                Err(_) => {
+            openshell_core::settings::SettingValueKind::Int => {
+                if let Ok(v) = raw.parse::<i64>() {
+                    setting_value::Value::IntValue(v)
+                } else {
                     let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
                         "invalid int value: {raw}"
                     ))));
                     return;
                 }
-            },
+            }
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
@@ -2057,11 +2289,10 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
             setting_value: Some(SettingValue { value: Some(value) }),
-            delete_setting: false,
-            global: false,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2089,17 +2320,17 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let name = sandbox_name.to_string();
     let key = entry.key.clone();
     let mut client = app.client.clone();
+    let workspace = app.selected_sandbox_workspace();
 
     tokio::spawn(async move {
         use openshell_core::proto::UpdateConfigRequest;
 
         let req = UpdateConfigRequest {
             name,
-            policy: None,
             setting_key: key,
-            setting_value: None,
             delete_setting: true,
-            global: false,
+            workspace,
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2141,21 +2372,34 @@ async fn refresh_sandboxes(app: &mut App) {
     let req = openshell_core::proto::ListSandboxesRequest {
         limit: 100,
         offset: 0,
+        label_selector: String::new(),
+        workspace: if app.all_workspaces {
+            String::new()
+        } else {
+            app.current_workspace.clone()
+        },
+        all_workspaces: app.all_workspaces,
     };
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to list sandboxes: {}", e.message());
+            app.status_text = format!("failed to list sandboxes: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("list sandboxes timed out");
+            app.status_text = "list sandboxes timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
             app.sandbox_count = sandboxes.len();
-            app.sandbox_ids = sandboxes.iter().map(|s| s.id.clone()).collect();
-            app.sandbox_names = sandboxes.iter().map(|s| s.name.clone()).collect();
-            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase)).collect();
+            app.sandbox_ids = sandboxes
+                .iter()
+                .map(|s| s.object_id().to_string())
+                .collect();
+            app.sandbox_names = sandboxes
+                .iter()
+                .map(|s| s.object_name().to_string())
+                .collect();
+            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
             app.sandbox_images = sandboxes
                 .iter()
                 .map(|s| {
@@ -2170,21 +2414,60 @@ async fn refresh_sandboxes(app: &mut App) {
                 .collect();
             app.sandbox_ages = sandboxes
                 .iter()
-                .map(|s| format_age(s.created_at_ms))
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map_or_else(|| "?".to_string(), |m| format_age(m.created_at_ms))
+                })
                 .collect();
             app.sandbox_created = sandboxes
                 .iter()
-                .map(|s| format_timestamp(s.created_at_ms))
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map_or_else(|| "?".to_string(), |m| format_timestamp(m.created_at_ms))
+                })
                 .collect();
 
-            app.sandbox_policy_versions =
-                sandboxes.iter().map(|s| s.current_policy_version).collect();
+            app.sandbox_policy_versions = sandboxes
+                .iter()
+                .map(openshell_core::proto::Sandbox::current_policy_version)
+                .collect();
 
             // Build NOTES column from active port forwards.
             let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
             app.sandbox_notes = sandboxes
                 .iter()
-                .map(|s| openshell_core::forward::build_sandbox_notes(&s.name, &forwards))
+                .map(|s| {
+                    let name = s.object_name();
+                    openshell_core::forward::build_sandbox_notes(name, &forwards)
+                })
+                .collect();
+
+            // Build LABELS column from metadata.
+            app.sandbox_labels = sandboxes
+                .iter()
+                .map(|s| {
+                    s.object_labels()
+                        .as_ref()
+                        .map(app::format_labels)
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            app.sandbox_annotations = sandboxes
+                .iter()
+                .map(|s| {
+                    s.metadata
+                        .as_ref()
+                        .map(|metadata| app::format_annotations(&metadata.annotations))
+                        .unwrap_or_default()
+                })
+                .collect();
+
+            app.sandbox_workspaces = sandboxes
+                .iter()
+                .map(|s| s.object_workspace().to_string())
                 .collect();
 
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
@@ -2227,10 +2510,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
             app.apply_sandbox_settings(inner.settings);
         }
         Ok(Err(e)) => {
-            tracing::warn!("failed to refresh sandbox policy: {}", e.message());
+            app.status_text = format!("failed to refresh sandbox policy: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("sandbox policy refresh timed out");
+            app.status_text = "sandbox policy refresh timed out".to_string();
         }
     }
 }
@@ -2244,22 +2527,17 @@ async fn refresh_draft_chunks(app: &mut App) {
     let req = openshell_core::proto::GetDraftPolicyRequest {
         name: sandbox_name,
         status_filter: String::new(),
+        workspace: app.selected_sandbox_workspace(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await {
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.draft_chunks = inner.chunks;
-            app.draft_version = inner.draft_version;
-            if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
-                app.draft_selected = app.draft_chunks.len() - 1;
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("draft chunks refresh: {}", e.message());
-        }
-        Err(_) => {
-            tracing::debug!("draft chunks refresh timed out");
+    if let Ok(Ok(resp)) =
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await
+    {
+        let inner = resp.into_inner();
+        app.draft_chunks = inner.chunks;
+        app.draft_version = inner.draft_version;
+        if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+            app.draft_selected = app.draft_chunks.len() - 1;
         }
     }
 }
@@ -2270,11 +2548,17 @@ async fn refresh_draft_chunks(app: &mut App) {
 /// badges without entering the sandbox detail view.
 async fn refresh_sandbox_draft_counts(app: &mut App) {
     let names: Vec<String> = app.sandbox_names.clone();
+    let workspaces: Vec<String> = app.sandbox_workspaces.clone();
     let mut counts = vec![0usize; names.len()];
     for (i, name) in names.iter().enumerate() {
+        let ws = workspaces
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| app.current_workspace.clone());
         let req = openshell_core::proto::GetDraftPolicyRequest {
             name: name.clone(),
             status_filter: "pending".to_string(),
+            workspace: ws,
         };
         if let Ok(Ok(resp)) =
             tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
@@ -2287,10 +2571,10 @@ async fn refresh_sandbox_draft_counts(app: &mut App) {
 
 fn phase_label(phase: i32) -> String {
     match phase {
-        1 => "Provisioning",
-        2 => "Ready",
-        3 => "Error",
-        4 => "Deleting",
+        x if x == SandboxPhase::Provisioning as i32 => "Provisioning",
+        x if x == SandboxPhase::Ready as i32 => "Ready",
+        x if x == SandboxPhase::Error as i32 => "Error",
+        x if x == SandboxPhase::Deleting as i32 => "Deleting",
         _ => "Unknown",
     }
     .to_string()

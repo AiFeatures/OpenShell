@@ -1,25 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub(crate) mod create_provider;
-pub(crate) mod create_sandbox;
+pub mod create_provider;
+pub mod create_sandbox;
 mod dashboard;
-pub(crate) mod global_settings;
-pub(crate) mod providers;
-pub(crate) mod sandbox_detail;
+pub mod global_settings;
+pub mod providers;
+pub mod sandbox_detail;
 mod sandbox_draft;
-pub(crate) mod sandbox_logs;
+pub mod sandbox_logs;
 mod sandbox_policy;
-pub(crate) mod sandbox_settings;
-pub(crate) mod sandboxes;
+pub mod sandbox_settings;
+pub mod sandboxes;
 mod splash;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
-use crate::app::{self, App, Focus, InputMode, Screen};
+use crate::app::{self, App, Focus, InputMode, Screen, SettingEditState};
+use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Splash screen is a full-screen takeover — no chrome.
@@ -89,12 +91,12 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 
     // Log detail popup renders over the full frame (not constrained to pane).
-    if app.focus == Focus::SandboxLogs {
-        if let Some(detail_idx) = app.log_detail_index {
-            let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
-            if let Some(log) = filtered.get(detail_idx) {
-                sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
-            }
+    if app.focus == Focus::SandboxLogs
+        && let Some(detail_idx) = app.log_detail_index
+    {
+        let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
+        if let Some(log) = filtered.get(detail_idx) {
+            sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
         }
     }
 
@@ -130,17 +132,29 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => Span::styled(&app.status_text, t.muted),
     };
 
+    let active_gateway_source = app
+        .gateways
+        .iter()
+        .find(|gateway| gateway.name == app.gateway_name)
+        .map_or("unknown", app::GatewayEntry::source_label);
+
     let mut parts: Vec<Span<'_>> = vec![
         Span::styled(" >_ OpenShell ", t.accent_bold),
         Span::styled(" ALPHA ", t.badge),
         Span::styled(" | ", t.muted),
         Span::styled("Current Gateway: ", t.text),
         Span::styled(&app.gateway_name, t.heading),
-        Span::styled(" (", t.muted),
+        Span::styled(" [", t.muted),
+        Span::styled(active_gateway_source, t.muted),
+        Span::styled("] (", t.muted),
         status_span,
         Span::styled(")", t.muted),
         Span::styled(" | ", t.muted),
     ];
+
+    parts.push(Span::styled("Workspace: ", t.text));
+    parts.push(Span::styled(app.workspace_display(), t.heading));
+    parts.push(Span::styled(" | ", t.muted));
 
     match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_title_bar"),
@@ -188,6 +202,27 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("[q]", t.muted),
                 Span::styled(" Quit", t.muted),
             ],
+            Focus::Providers if app.providers_v2_enabled => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Detail", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("read-only", t.muted),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             Focus::Providers => vec![
                 Span::styled(" ", t.text),
                 Span::styled("[Tab]", t.key_hint),
@@ -229,6 +264,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", t.text),
                 Span::styled("[c]", t.key_hint),
                 Span::styled(" Create Sandbox", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[w]", t.key_hint),
+                Span::styled(" Workspace", t.text),
                 Span::styled("  |  ", t.border),
                 Span::styled("[:]", t.muted),
                 Span::styled(" Command  ", t.muted),
@@ -328,8 +366,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 let selected_status = app
                     .draft_chunks
                     .get(app.draft_scroll + app.draft_selected)
-                    .map(|c| c.status.as_str())
-                    .unwrap_or("");
+                    .map_or("", |c| c.status.as_str());
                 let mut spans = vec![
                     Span::styled(" ", t.text),
                     Span::styled("[j/k]", t.key_hint),
@@ -454,9 +491,182 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(bar, area);
 }
 
+/// Render an empty-state message inside a bordered panel.
+///
+/// Calculates an inset [`Rect`] that clears the panel border and renders
+/// `text` with the given `style`.  Use this whenever a table or list has no
+/// rows to display.
+pub fn draw_empty_message(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(3),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), inner);
+}
+
+/// Center a popup rectangle within `area` using absolute width and height (in
+/// terminal columns/rows).
+pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let horiz = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((area.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(vert[1]);
+    horiz[1]
+}
+
+// ---------------------------------------------------------------------------
+// Shared setting-edit overlay (used by both global and sandbox settings panes)
+// ---------------------------------------------------------------------------
+
+/// Render the generic setting-edit text-input overlay.
+///
+/// Both the global-settings and sandbox-settings panes show the same editor
+/// overlay — an input box with the setting key/type in the title, an error
+/// line when validation fails, and `[Enter]`/`[Esc]` hints.  This function
+/// is the single implementation; each pane resolves its own entry and then
+/// delegates here.
+fn draw_setting_edit_overlay(
+    frame: &mut Frame<'_>,
+    key: &str,
+    kind: openshell_core::settings::SettingValueKind,
+    edit: &SettingEditState,
+    area: Rect,
+    theme: &Theme,
+) {
+    let t = theme;
+    let title = format!(" Edit: {} ({}) ", key, kind.as_str());
+    let mut lines = vec![
+        Line::from(Span::styled(&title, t.heading)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Value: ", t.muted),
+            Span::styled(&edit.input, t.text),
+            Span::styled("_", t.accent),
+        ]),
+    ];
+
+    if let Some(ref err) = edit.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(err.as_str(), t.status_err)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Confirm  ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
+    ]));
+
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(50, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(t.border_focused)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Draw a labeled text input field.
+///
+/// `cursor` is the cursor character shown when `focused` (e.g. `"█"` or `"_"`).
+/// `show_gap` appends an extra blank row below the input line.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_field(
+    frame: &mut Frame<'_>,
+    label: &str,
+    value: &str,
+    placeholder: &str,
+    focused: bool,
+    area: Rect,
+    theme: &Theme,
+    cursor: &str,
+    show_gap: bool,
+) {
+    let t = theme;
+    let chunks = if show_gap {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+                Constraint::Length(1), // gap
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // label
+                Constraint::Length(1), // input
+            ])
+            .split(area)
+    };
+
+    let label_style = if focused { t.accent_bold } else { t.text };
+    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
+    if !placeholder.is_empty() {
+        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
+
+    let display = if value.is_empty() && !focused {
+        Line::from(Span::styled("  -", t.muted))
+    } else if focused {
+        Line::from(vec![
+            Span::styled(format!("  {value}"), t.accent),
+            Span::styled(cursor, t.accent),
+        ])
+    } else {
+        Line::from(Span::styled(format!("  {value}"), t.text))
+    };
+    frame.render_widget(Paragraph::new(display), chunks[1]);
+}
+
+/// Render a bordered confirmation popup centred on `area`.
+///
+/// `lines` is the popup body; height is derived from the line count.
+/// Use `t.border_focused` for confirmations and `t.status_err` for destructive
+/// actions.
+fn draw_confirm_popup(
+    frame: &mut Frame<'_>,
+    lines: Vec<Line<'_>>,
+    border_style: Style,
+    width: u16,
+    area: Rect,
+) {
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(width, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 /// Center a popup rectangle within `area` using percentage-based width and
 /// an absolute height (in rows).
-pub(crate) fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
+pub fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

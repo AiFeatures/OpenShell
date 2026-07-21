@@ -8,6 +8,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, CreateProviderPhase, ProviderKeyField};
 
+use super::centered_rect;
+
 /// Draw the create provider modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let t = &app.theme;
@@ -277,7 +279,7 @@ fn draw_enter_key(
 
     // Name field.
     let name_placeholder = format!("optional (defaults to {selected_type})");
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Name",
         &form.name,
@@ -285,6 +287,8 @@ fn draw_enter_key(
         form.key_field == ProviderKeyField::Name,
         chunks[idx],
         t,
+        "_",
+        false,
     );
     idx += 1;
 
@@ -293,7 +297,7 @@ fn draw_enter_key(
 
     if form.is_generic {
         // Env var name field.
-        draw_text_field(
+        super::draw_text_field(
             frame,
             "Env var name",
             &form.generic_env_name,
@@ -301,6 +305,8 @@ fn draw_enter_key(
             form.key_field == ProviderKeyField::EnvVarName,
             chunks[idx],
             t,
+            "_",
+            false,
         );
         idx += 1;
 
@@ -313,7 +319,6 @@ fn draw_enter_key(
             chunks[idx],
             t,
         );
-        idx += 1;
     } else {
         // Credential rows — env var name + masked value on the same line.
         let max_name_len = form
@@ -330,7 +335,7 @@ fn draw_enter_key(
             .map(|(i, (env_name, value))| {
                 let is_focused =
                     form.key_field == ProviderKeyField::Credential && i == form.cred_cursor;
-                let padded = format!("{:width$}", env_name, width = max_name_len);
+                let padded = format!("{env_name:max_name_len$}");
                 let name_style = if is_focused { t.accent_bold } else { t.text };
                 let mut spans = vec![Span::styled(format!("  {padded}: "), name_style)];
                 if value.is_empty() {
@@ -353,8 +358,8 @@ fn draw_enter_key(
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), chunks[idx]);
-        idx += 1;
     }
+    idx += 1;
 
     // Spacer.
     idx += 1;
@@ -482,16 +487,22 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
 
-    let modal_width = 55u16.min(area.width.saturating_sub(4));
-    // name(1) + type(1) + spacer(1) + cred_key(1) + masked(1) + spacer(1) + hint(1)
-    let content_height = 7;
+    let modal_width = 84u16.min(area.width.saturating_sub(4));
+    let content_height = 24u16;
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
 
     frame.render_widget(Clear, popup_area);
 
+    let title = if detail.show_raw_provider {
+        " Provider Object YAML "
+    } else if detail.show_raw_profile {
+        " Provider Profile YAML "
+    } else {
+        " Provider Detail "
+    };
     let block = Block::default()
-        .title(Span::styled(" Provider Detail ", t.heading))
+        .title(Span::styled(title, t.heading))
         .borders(Borders::ALL)
         .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
@@ -499,57 +510,153 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    if detail.show_raw_provider {
+        draw_raw_yaml(
+            frame,
+            &detail.raw_provider_yaml,
+            detail.raw_provider_scroll,
+            "Summary",
+            "o",
+            inner,
+            t,
+        );
+        return;
+    }
+
+    if detail.show_raw_profile {
+        draw_raw_yaml(
+            frame,
+            detail
+                .raw_profile_yaml
+                .as_deref()
+                .unwrap_or("No provider profile is available for this provider."),
+            detail.raw_profile_scroll,
+            "Summary",
+            "y",
+            inner,
+            t,
+        );
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", t.muted),
+        Span::styled(&detail.name, t.heading),
+        Span::styled("  Type: ", t.muted),
+        Span::styled(&detail.provider_type, t.text),
+    ]));
+    if !detail.provider_id.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Id: ", t.muted),
+            Span::styled(&detail.provider_id, t.muted),
+            Span::styled("  Resource version: ", t.muted),
+            Span::styled(detail.resource_version.to_string(), t.muted),
+        ]));
+    }
+    if let Some(profile_name) = &detail.profile_name {
+        lines.push(Line::from(vec![
+            Span::styled("Profile: ", t.muted),
+            Span::styled(profile_name, t.text),
+            Span::styled("  Category: ", t.muted),
+            Span::styled(
+                detail.profile_category.as_deref().unwrap_or("other"),
+                t.muted,
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Profile: <none> (legacy/unprofiled provider)",
+            t.status_warn,
+        )));
+    }
+    if let Some(description) = &detail.profile_description {
+        lines.push(Line::from(vec![
+            Span::styled("Description: ", t.muted),
+            Span::styled(description, t.text),
+        ]));
+    }
+    push_section(&mut lines, "Credentials", &detail.credential_lines, t);
+    push_section(&mut lines, "Config Keys", &detail.config_lines, t);
+    push_section(&mut lines, "Policy", &detail.policy_lines, t);
+    push_section(&mut lines, "Discovery", &detail.discovery_lines, t);
+    push_section(&mut lines, "Refresh", &detail.refresh_lines, t);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // name
-            Constraint::Length(1), // type
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // cred key
-            Constraint::Length(1), // masked value
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // hint
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(inner);
-
+    let total = lines.len();
+    let scroll = detail.summary_scroll.min(total.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Name: ", t.muted),
-            Span::styled(&detail.name, t.heading),
-        ])),
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         chunks[0],
     );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", t.muted),
-            Span::styled(&detail.provider_type, t.text),
-        ])),
-        chunks[1],
-    );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Credential: ", t.muted),
-            Span::styled(&detail.credential_key, t.text),
-        ])),
-        chunks[3],
-    );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Value: ", t.muted),
-            Span::styled(&detail.masked_value, t.muted),
-        ])),
-        chunks[4],
-    );
-
-    let hint = Line::from(vec![
+    let position = (scroll + 1).min(total.max(1));
+    let mut hint_spans = vec![
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Scroll  ", t.muted),
+        Span::styled("[o]", t.key_hint),
+        Span::styled(" Object YAML  ", t.muted),
+    ];
+    if detail.raw_profile_yaml.is_some() {
+        hint_spans.extend([
+            Span::styled("[y]", t.key_hint),
+            Span::styled(" Profile YAML  ", t.muted),
+        ]);
+    }
+    hint_spans.extend([
         Span::styled("[Esc]", t.key_hint),
-        Span::styled(" Close", t.muted),
+        Span::styled(" Close  ", t.muted),
+        Span::styled(format!("[{position}/{total}]"), t.muted),
     ]);
-    frame.render_widget(Paragraph::new(hint), chunks[6]);
+    frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[1]);
+}
+
+fn draw_raw_yaml(
+    frame: &mut Frame<'_>,
+    raw: &str,
+    scroll: usize,
+    toggle_label: &'static str,
+    toggle_key: &'static str,
+    area: Rect,
+    t: &crate::theme::Theme,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(raw).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        chunks[0],
+    );
+    let total = raw.lines().count();
+    let position = (scroll + 1).min(total.max(1));
+    let hint = Line::from(vec![
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Scroll  ", t.muted),
+        Span::styled(format!("[{toggle_key}]"), t.key_hint),
+        Span::styled(format!(" {toggle_label}  "), t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Close  ", t.muted),
+        Span::styled(format!("[{position}/{total}]"), t.muted),
+    ]);
+    frame.render_widget(Paragraph::new(hint), chunks[1]);
+}
+
+fn push_section(
+    lines: &mut Vec<Line<'_>>,
+    title: &'static str,
+    values: &[String],
+    t: &crate::theme::Theme,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(title, t.heading)));
+    for value in values {
+        lines.push(Line::from(vec![
+            Span::styled("  - ", t.muted),
+            Span::styled(value.clone(), t.text),
+        ]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,44 +777,6 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn draw_text_field(
-    frame: &mut Frame<'_>,
-    label: &str,
-    value: &str,
-    placeholder: &str,
-    focused: bool,
-    area: Rect,
-    theme: &crate::theme::Theme,
-) {
-    let t = theme;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // input
-        ])
-        .split(area);
-
-    let label_style = if focused { t.accent_bold } else { t.text };
-    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
-    if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
-    }
-    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
-
-    let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", t.muted))
-    } else if focused {
-        Line::from(vec![
-            Span::styled(format!("  {value}"), t.accent),
-            Span::styled("_", t.accent),
-        ])
-    } else {
-        Line::from(Span::styled(format!("  {value}"), t.text))
-    };
-    frame.render_widget(Paragraph::new(display), chunks[1]);
-}
-
 fn draw_secret_field(
     frame: &mut Frame<'_>,
     label: &str,
@@ -743,24 +812,4 @@ fn draw_secret_field(
         Line::from(Span::styled(format!("  {masked}"), t.muted))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }

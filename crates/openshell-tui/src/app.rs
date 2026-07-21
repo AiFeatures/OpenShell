@@ -5,9 +5,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use openshell_bootstrap::GatewayMetadataSource;
+use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 // ---------------------------------------------------------------------------
@@ -212,10 +215,21 @@ pub fn display_setting_value(value: &Option<setting_value::Value>) -> String {
 // Gateway entry
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayEntry {
     pub name: String,
     pub endpoint: String,
     pub is_remote: bool,
+    pub source: Option<GatewayMetadataSource>,
+}
+
+impl GatewayEntry {
+    pub const fn source_label(&self) -> &'static str {
+        match self.source {
+            Some(source) => source.label(),
+            None => "unknown",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +318,8 @@ pub struct CreateSandboxForm {
     /// When the create animation started (for pacman timing).
     pub anim_start: Option<Instant>,
     /// Buffered create result — held until min display time elapses.
-    pub create_result: Option<Result<String, String>>,
+    /// `Ok((name, workspace))` or `Err(message)`.
+    pub create_result: Option<Result<(String, String), String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +374,7 @@ pub struct CreateProviderForm {
     pub is_generic: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
-    /// Warning shown at top of EnterKey modal (e.g. autodetect failure).
+    /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
     pub warning: Option<String>,
     /// Animation start time.
     pub anim_start: Option<Instant>,
@@ -375,9 +390,103 @@ pub struct CreateProviderForm {
 
 pub struct ProviderDetailView {
     pub name: String,
+    pub provider_id: String,
     pub provider_type: String,
-    pub credential_key: String,
-    pub masked_value: String,
+    pub resource_version: u64,
+    pub summary_scroll: usize,
+    pub show_raw_profile: bool,
+    pub show_raw_provider: bool,
+    pub raw_profile_scroll: usize,
+    pub raw_provider_scroll: usize,
+    pub raw_profile_yaml: Option<String>,
+    pub raw_provider_yaml: String,
+    pub profile_name: Option<String>,
+    pub profile_category: Option<String>,
+    pub profile_description: Option<String>,
+    pub credential_lines: Vec<String>,
+    pub config_lines: Vec<String>,
+    pub policy_lines: Vec<String>,
+    pub discovery_lines: Vec<String>,
+    pub refresh_lines: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct ProviderV2Entry {
+    pub provider: openshell_core::proto::Provider,
+    pub profile: Option<openshell_core::proto::ProviderProfile>,
+}
+
+impl ProviderV2Entry {
+    pub fn name(&self) -> &str {
+        provider_name(&self.provider)
+    }
+
+    pub fn profile_label(&self) -> String {
+        self.profile.as_ref().map_or_else(
+            || format!("{} (unprofiled)", self.provider.r#type),
+            |profile| {
+                if profile.display_name.is_empty() {
+                    profile.id.clone()
+                } else {
+                    profile.display_name.clone()
+                }
+            },
+        )
+    }
+
+    pub fn category_label(&self) -> &'static str {
+        self.profile.as_ref().map_or("legacy", |profile| {
+            provider_category_label(profile.category)
+        })
+    }
+
+    pub fn credential_summary(&self) -> String {
+        let stored = self.provider.credentials.len();
+        self.profile.as_ref().map_or_else(
+            || format!("{stored} key{}", plural(stored)),
+            |profile| {
+                let required = profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.required)
+                    .count();
+                let required_present = profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.required)
+                    .filter(|credential| {
+                        credential
+                            .env_vars
+                            .iter()
+                            .any(|key| self.provider.credentials.contains_key(key))
+                    })
+                    .count();
+                format!(
+                    "{required_present}/{required} req, {stored} key{}",
+                    plural(stored)
+                )
+            },
+        )
+    }
+
+    pub fn policy_summary(&self) -> String {
+        self.profile.as_ref().map_or_else(
+            || "no profile".to_string(),
+            |profile| {
+                let endpoints = profile.endpoints.len();
+                let binaries = profile.binaries.len();
+                let mut summary = format!(
+                    "{endpoints} endpoint{}, {binaries} bin{}",
+                    plural(endpoints),
+                    plural(binaries)
+                );
+                if profile.inference_capable {
+                    summary.push_str(", inference");
+                }
+                summary
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +522,7 @@ pub struct App {
     // Active gateway connection
     pub gateway_name: String,
     pub endpoint: String,
-    pub client: OpenShellClient<Channel>,
+    pub client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
     pub status_text: String,
 
     // Gateway list
@@ -421,10 +530,19 @@ pub struct App {
     pub gateway_selected: usize,
     pub pending_gateway_switch: Option<String>,
 
+    // Workspace filter
+    pub current_workspace: String,
+    pub all_workspaces: bool,
+    pub workspace_names: Vec<String>,
+    pub pending_workspace_refresh: bool,
+
     // Provider list
+    pub providers_v2_enabled: bool,
+    pub provider_entries: Vec<ProviderV2Entry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
     pub provider_cred_keys: Vec<String>,
+    pub provider_workspaces: Vec<String>,
     pub provider_selected: usize,
     pub provider_count: usize,
 
@@ -463,6 +581,11 @@ pub struct App {
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
+    pub sandbox_labels: Vec<String>,
+    /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
+    pub sandbox_annotations: Vec<String>,
+    pub sandbox_workspaces: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -491,6 +614,8 @@ pub struct App {
     pub sandbox_providers_list: Vec<String>,
     pub policy_lines: Vec<ratatui::text::Line<'static>>,
     pub policy_scroll: usize,
+    /// Visible line count in the policy pane, set during draw for PageUp/PageDown.
+    pub policy_viewport_height: usize,
 
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
@@ -544,11 +669,209 @@ pub struct App {
     pub approve_all_confirm_chunks: Vec<openshell_core::proto::PolicyChunk>,
 }
 
+// ---------------------------------------------------------------------------
+// Label formatting utilities
+// ---------------------------------------------------------------------------
+
+/// Sanitize a string for safe terminal display by filtering control characters.
+///
+/// Removes all control characters except newlines to prevent ANSI escape
+/// sequences or other terminal manipulation.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
+}
+
+/// Format object labels as a comma-separated key=value string.
+///
+/// Labels are sorted by key for deterministic output. Returns an empty string
+/// if the map is empty. Values are sanitized to prevent terminal escape sequences.
+pub fn format_labels(labels: &HashMap<String, String>) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<_> = labels.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    sorted
+        .iter()
+        .map(|(k, v)| format!("{}={}", sanitize_for_display(k), sanitize_for_display(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Format object annotations as a comma-separated key=value string.
+pub fn format_annotations(annotations: &HashMap<String, String>) -> String {
+    format_labels(annotations)
+}
+
+pub fn provider_name(provider: &openshell_core::proto::Provider) -> &str {
+    provider
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.name.as_str())
+}
+
+fn provider_id(provider: &openshell_core::proto::Provider) -> &str {
+    provider
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.id.as_str())
+}
+
+fn provider_resource_version(provider: &openshell_core::proto::Provider) -> u64 {
+    provider
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version)
+}
+
+pub fn provider_category_label(category: i32) -> &'static str {
+    match openshell_core::proto::ProviderProfileCategory::try_from(category)
+        .unwrap_or(openshell_core::proto::ProviderProfileCategory::Other)
+    {
+        openshell_core::proto::ProviderProfileCategory::Inference => "inference",
+        openshell_core::proto::ProviderProfileCategory::Agent => "agent",
+        openshell_core::proto::ProviderProfileCategory::SourceControl => "source_control",
+        openshell_core::proto::ProviderProfileCategory::Messaging => "messaging",
+        openshell_core::proto::ProviderProfileCategory::Data => "data",
+        openshell_core::proto::ProviderProfileCategory::Knowledge => "knowledge",
+        openshell_core::proto::ProviderProfileCategory::Other
+        | openshell_core::proto::ProviderProfileCategory::Unspecified => "other",
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn refresh_strategy_label(strategy: i32) -> &'static str {
+    match openshell_core::proto::ProviderCredentialRefreshStrategy::try_from(strategy)
+        .unwrap_or(openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified)
+    {
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Static => "static",
+        openshell_core::proto::ProviderCredentialRefreshStrategy::External => "external",
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2RefreshToken => {
+            "oauth2_refresh_token"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => {
+            "oauth2_client_credentials"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
+            "google_service_account_jwt"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            "aws_sts_assume_role"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+fn mask_secret(value: &str) -> String {
+    let len = value.chars().count();
+    if len <= 4 {
+        "****".to_string()
+    } else {
+        let start: String = value.chars().take(2).collect();
+        let end: String = value.chars().skip(len - 2).collect();
+        format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
+    }
+}
+
+fn provider_to_redacted_yaml(provider: &openshell_core::proto::Provider) -> String {
+    let mut out = String::new();
+    out.push_str("name: ");
+    out.push_str(&yaml_scalar(provider_name(provider)));
+    out.push('\n');
+    out.push_str("type: ");
+    out.push_str(&yaml_scalar(&provider.r#type));
+    out.push('\n');
+
+    out.push_str("credentials:");
+    if provider.credentials.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut keys = provider.credentials.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": \"<redacted>\"\n");
+        }
+    }
+
+    out.push_str("config:");
+    if provider.config.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut entries = provider.config.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&yaml_scalar(value));
+            out.push('\n');
+        }
+    }
+
+    if !provider.credential_expires_at_ms.is_empty() {
+        out.push_str("credential_expires_at_ms:\n");
+        let mut entries = provider.credential_expires_at_ms.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+    }
+
+    if let Some(metadata) = &provider.metadata {
+        out.push_str("metadata:\n");
+        out.push_str("  id: ");
+        out.push_str(&yaml_scalar(&metadata.id));
+        out.push('\n');
+        out.push_str("  resource_version: ");
+        out.push_str(&metadata.resource_version.to_string());
+        out.push('\n');
+        if !metadata.labels.is_empty() {
+            out.push_str("  labels:\n");
+            let mut labels = metadata.labels.iter().collect::<Vec<_>>();
+            labels.sort_by_key(|(key, _)| *key);
+            for (key, value) in labels {
+                out.push_str("    ");
+                out.push_str(key);
+                out.push_str(": ");
+                out.push_str(&yaml_scalar(value));
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn yaml_scalar(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
+}
+
 impl App {
+    #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
-        client: OpenShellClient<Channel>,
+        client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
         gateway_name: String,
         endpoint: String,
+        workspace: String,
         theme: crate::theme::Theme,
     ) -> Self {
         Self {
@@ -577,9 +900,16 @@ impl App {
             confirm_setting_delete: None,
             pending_setting_set: false,
             pending_setting_delete: false,
+            current_workspace: workspace,
+            all_workspaces: false,
+            workspace_names: Vec::new(),
+            pending_workspace_refresh: false,
+            providers_v2_enabled: false,
+            provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
+            provider_workspaces: Vec::new(),
             provider_selected: 0,
             provider_count: 0,
             create_provider_form: None,
@@ -597,6 +927,9 @@ impl App {
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_labels: Vec::new(),
+            sandbox_annotations: Vec::new(),
+            sandbox_workspaces: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -619,6 +952,7 @@ impl App {
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
             policy_scroll: 0,
+            policy_viewport_height: 0,
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
@@ -659,6 +993,16 @@ impl App {
         revision: u64,
     ) {
         self.global_settings_revision = revision;
+        self.providers_v2_enabled = settings
+            .get(settings::PROVIDERS_V2_ENABLED_KEY)
+            .and_then(|value| value.value.as_ref())
+            .and_then(|value| match value {
+                setting_value::Value::BoolValue(value) => Some(*value),
+                setting_value::Value::StringValue(value) => settings::parse_bool_like(value),
+                setting_value::Value::IntValue(value) => Some(*value != 0),
+                setting_value::Value::BytesValue(_) => None,
+            })
+            .unwrap_or(false);
         self.global_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
@@ -685,18 +1029,18 @@ impl App {
         self.sandbox_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
-                let (value, scope) = settings
-                    .get(reg.key)
-                    .map(|es| {
-                        let v = es.value.as_ref().and_then(|sv| sv.value.clone());
-                        let s = match es.scope {
-                            1 => SettingScope::Sandbox,
-                            2 => SettingScope::Global,
-                            _ => SettingScope::Unset,
-                        };
-                        (v, s)
-                    })
-                    .unwrap_or((None, SettingScope::Unset));
+                let (value, scope) =
+                    settings
+                        .get(reg.key)
+                        .map_or((None, SettingScope::Unset), |es| {
+                            let v = es.value.as_ref().and_then(|sv| sv.value.clone());
+                            let s = match es.scope {
+                                1 => SettingScope::Sandbox,
+                                2 => SettingScope::Global,
+                                _ => SettingScope::Unset,
+                            };
+                            (v, s)
+                        });
                 SandboxSettingEntry {
                     key: reg.key.to_string(),
                     kind: reg.kind,
@@ -733,6 +1077,43 @@ impl App {
         if self.screen == Screen::Splash {
             self.screen = Screen::Dashboard;
             self.splash_start = None;
+        }
+    }
+
+    pub fn cycle_workspace(&mut self) {
+        if self.all_workspaces {
+            self.all_workspaces = false;
+            self.current_workspace = "default".to_string();
+        } else if self.workspace_names.is_empty() {
+            self.all_workspaces = true;
+            self.current_workspace = "default".to_string();
+        } else {
+            let current_idx = self
+                .workspace_names
+                .iter()
+                .position(|n| n == &self.current_workspace);
+            match current_idx {
+                Some(idx) if idx + 1 < self.workspace_names.len() => {
+                    self.current_workspace = self.workspace_names[idx + 1].clone();
+                }
+                _ => {
+                    self.all_workspaces = true;
+                    self.current_workspace = "default".to_string();
+                }
+            }
+        }
+        // Reset selection indices so the cursor doesn't point past the end
+        // of the new workspace's (potentially shorter) sandbox/provider lists.
+        self.sandbox_selected = 0;
+        self.provider_selected = 0;
+        self.pending_workspace_refresh = true;
+    }
+
+    pub fn workspace_display(&self) -> &str {
+        if self.all_workspaces {
+            "all"
+        } else {
+            &self.current_workspace
         }
     }
 
@@ -815,6 +1196,70 @@ impl App {
         }
     }
 
+    const DASHBOARD_PANELS: [Focus; 3] = [Focus::Gateways, Focus::Providers, Focus::Sandboxes];
+
+    fn panel_item_count(&self, focus: Focus) -> usize {
+        match focus {
+            Focus::Gateways => self.gateways.len(),
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings.len()
+                } else {
+                    self.provider_count
+                }
+            }
+            Focus::Sandboxes => self.sandbox_count,
+            _ => 0,
+        }
+    }
+
+    fn set_panel_cursor(&mut self, focus: Focus, index: usize) {
+        match focus {
+            Focus::Gateways => self.gateway_selected = index,
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings_selected = index;
+                } else {
+                    self.provider_selected = index;
+                }
+            }
+            Focus::Sandboxes => self.sandbox_selected = index,
+            _ => {}
+        }
+    }
+
+    fn overflow_focus_down(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let next = Self::DASHBOARD_PANELS[(cur_idx + offset) % Self::DASHBOARD_PANELS.len()];
+            if self.panel_item_count(next) > 0 {
+                self.focus = next;
+                self.set_panel_cursor(next, 0);
+                return;
+            }
+        }
+    }
+
+    fn overflow_focus_up(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let prev = Self::DASHBOARD_PANELS
+                [(cur_idx + Self::DASHBOARD_PANELS.len() - offset) % Self::DASHBOARD_PANELS.len()];
+            let count = self.panel_item_count(prev);
+            if count > 0 {
+                self.focus = prev;
+                self.set_panel_cursor(prev, count - 1);
+                return;
+            }
+        }
+    }
+
     fn handle_gateways_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
@@ -825,13 +1270,18 @@ impl App {
                 self.command_input.clear();
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.gateways.is_empty() {
-                    self.gateway_selected =
-                        (self.gateway_selected + 1).min(self.gateways.len() - 1);
+                if !self.gateways.is_empty() && self.gateway_selected < self.gateways.len() - 1 {
+                    self.gateway_selected += 1;
+                } else {
+                    self.overflow_focus_down();
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.gateway_selected = self.gateway_selected.saturating_sub(1);
+                if !self.gateways.is_empty() && self.gateway_selected > 0 {
+                    self.gateway_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Enter => {
                 if let Some(entry) = self.gateways.get(self.gateway_selected) {
@@ -869,33 +1319,37 @@ impl App {
                 self.command_input.clear();
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.provider_count > 0 {
-                    self.provider_selected =
-                        (self.provider_selected + 1).min(self.provider_count - 1);
+                if self.provider_count > 0 && self.provider_selected < self.provider_count - 1 {
+                    self.provider_selected += 1;
+                } else {
+                    self.overflow_focus_down();
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.provider_selected = self.provider_selected.saturating_sub(1);
-            }
-            KeyCode::Char('c') => {
-                self.open_create_provider_form();
-            }
-            KeyCode::Enter => {
-                // Fetch and show provider detail.
-                if self.provider_count > 0 {
-                    self.pending_provider_get = true;
+                if self.provider_count > 0 && self.provider_selected > 0 {
+                    self.provider_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
                 }
             }
-            KeyCode::Char('u') => {
-                // Open update form for the selected provider.
-                if self.provider_count > 0 {
-                    self.open_update_provider_form();
+            KeyCode::Char('c') if !self.providers_v2_enabled => {
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create providers.".to_string();
+                } else {
+                    self.open_create_provider_form();
                 }
             }
-            KeyCode::Char('d') => {
-                if self.provider_count > 0 {
-                    self.confirm_provider_delete = true;
-                }
+            // Fetch and show provider detail.
+            KeyCode::Enter if self.provider_count > 0 => {
+                self.pending_provider_get = true;
+            }
+            // Open update form for the selected provider.
+            KeyCode::Char('u') if self.provider_count > 0 && !self.providers_v2_enabled => {
+                self.open_update_provider_form();
+            }
+            KeyCode::Char('d') if self.provider_count > 0 && !self.providers_v2_enabled => {
+                self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
                 self.middle_pane_tab = self.middle_pane_tab.next();
@@ -914,13 +1368,20 @@ impl App {
                 self.command_input.clear();
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.global_settings.is_empty() {
-                    self.global_settings_selected =
-                        (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
+                if !self.global_settings.is_empty()
+                    && self.global_settings_selected < self.global_settings.len() - 1
+                {
+                    self.global_settings_selected += 1;
+                } else {
+                    self.overflow_focus_down();
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.global_settings_selected = self.global_settings_selected.saturating_sub(1);
+                if !self.global_settings.is_empty() && self.global_settings_selected > 0 {
+                    self.global_settings_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
                 self.middle_pane_tab = self.middle_pane_tab.next();
@@ -994,7 +1455,15 @@ impl App {
                                 return;
                             }
                         }
-                        SettingValueKind::String => {}
+                        SettingValueKind::String => {
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
+                            }
+                        }
                     }
                 }
                 edit.error = None;
@@ -1048,24 +1517,36 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.sandbox_count > 0 {
-                    self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
+                if self.sandbox_count > 0 && self.sandbox_selected < self.sandbox_count - 1 {
+                    self.sandbox_selected += 1;
+                } else {
+                    self.overflow_focus_down();
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
+                if self.sandbox_count > 0 && self.sandbox_selected > 0 {
+                    self.sandbox_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('c') => {
-                self.open_create_form();
-            }
-            KeyCode::Enter => {
-                if self.sandbox_count > 0 {
-                    self.screen = Screen::Sandbox;
-                    self.focus = Focus::SandboxPolicy;
-                    self.confirm_delete = false;
-                    self.pending_sandbox_detail = true;
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create sandboxes.".to_string();
+                } else {
+                    self.open_create_form();
                 }
+            }
+            KeyCode::Enter if self.sandbox_count > 0 => {
+                self.screen = Screen::Sandbox;
+                self.focus = Focus::SandboxPolicy;
+                self.confirm_delete = false;
+                self.pending_sandbox_detail = true;
             }
             KeyCode::Esc => {
                 self.focus = Focus::Providers;
@@ -1116,10 +1597,8 @@ impl App {
             KeyCode::Char('r') => {
                 self.focus = Focus::SandboxDraft;
             }
-            KeyCode::Char('s') => {
-                if self.sandbox_count > 0 {
-                    self.pending_shell_connect = true;
-                }
+            KeyCode::Char('s') if self.sandbox_count > 0 => {
+                self.pending_shell_connect = true;
             }
             KeyCode::Char('d') => {
                 self.confirm_delete = true;
@@ -1130,9 +1609,21 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.scroll_policy(-1);
             }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(-delta);
+            }
             KeyCode::Char('G') => {
-                // Scroll to bottom.
-                self.policy_scroll = self.policy_lines.len().saturating_sub(1);
+                // Scroll to bottom, keeping a full viewport visible.
+                self.policy_scroll = self
+                    .policy_lines
+                    .len()
+                    .saturating_sub(self.policy_viewport_height.max(1));
             }
             KeyCode::Char('g') => {
                 self.policy_scroll = 0;
@@ -1161,11 +1652,9 @@ impl App {
                 // In policy tab, 'l' opens logs. In settings tab, switch tab.
                 self.sandbox_policy_tab = self.sandbox_policy_tab.next();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.sandbox_settings.is_empty() {
-                    self.sandbox_settings_selected =
-                        (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.sandbox_settings.is_empty() => {
+                self.sandbox_settings_selected =
+                    (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_settings_selected = self.sandbox_settings_selected.saturating_sub(1);
@@ -1246,7 +1735,15 @@ impl App {
                                 return;
                             }
                         }
-                        SettingValueKind::String => {}
+                        SettingValueKind::String => {
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
+                            }
+                        }
                     }
                 }
                 edit.error = None;
@@ -1370,10 +1867,8 @@ impl App {
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
-            KeyCode::Enter => {
-                if !self.draft_chunks.is_empty() {
-                    self.draft_detail_open = true;
-                }
+            KeyCode::Enter if !self.draft_chunks.is_empty() => {
+                self.draft_detail_open = true;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {
@@ -1397,17 +1892,30 @@ impl App {
                     self.draft_scroll -= 1;
                 }
             }
+            // Page-scroll by one viewport height, clamping the cursor to
+            // stay within the visible range.
+            KeyCode::PageDown if total > 0 => {
+                let page = vh.max(1);
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = (self.draft_scroll + page).min(max_scroll);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
+            KeyCode::PageUp if total > 0 => {
+                let page = vh.max(1);
+                self.draft_scroll = self.draft_scroll.saturating_sub(page);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
             KeyCode::Char('g') => {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
             }
-            KeyCode::Char('G') => {
-                if total > 0 {
-                    let max_scroll = total.saturating_sub(vh.min(total));
-                    self.draft_scroll = max_scroll;
-                    let visible = total.saturating_sub(self.draft_scroll).min(vh);
-                    self.draft_selected = visible.saturating_sub(1);
-                }
+            KeyCode::Char('G') if total > 0 => {
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = max_scroll;
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = visible.saturating_sub(1);
             }
             // Approve selected chunk (pending → approved, rejected → approved).
             KeyCode::Char('a') => {
@@ -1463,16 +1971,15 @@ impl App {
     }
 
     /// Scroll policy pane by a delta (positive = down, negative = up).
+    ///
+    /// Clamps so at least one viewport of content remains visible.
     pub fn scroll_policy(&mut self, delta: isize) {
-        let max = self.policy_lines.len().saturating_sub(1);
-        if delta < 0 {
-            self.policy_scroll = self.policy_scroll.saturating_sub(delta.unsigned_abs());
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            {
-                self.policy_scroll = (self.policy_scroll + delta as usize).min(max);
-            }
-        }
+        self.policy_scroll = clamped_scroll(
+            self.policy_scroll,
+            delta,
+            self.policy_lines.len(),
+            self.policy_viewport_height,
+        );
     }
 
     fn handle_logs_key(&mut self, key: KeyEvent) {
@@ -1552,12 +2059,10 @@ impl App {
                     self.log_autoscroll = false;
                 }
             }
-            KeyCode::Enter => {
-                if filtered_len > 0 && self.log_selection_anchor.is_none() {
-                    let abs = self.sandbox_log_scroll + self.log_cursor;
-                    if abs < filtered_len {
-                        self.log_detail_index = Some(abs);
-                    }
+            KeyCode::Enter if filtered_len > 0 && self.log_selection_anchor.is_none() => {
+                let abs = self.sandbox_log_scroll + self.log_cursor;
+                if abs < filtered_len {
+                    self.log_detail_index = Some(abs);
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1581,6 +2086,17 @@ impl App {
                 } else if self.sandbox_log_scroll > 0 {
                     self.sandbox_log_scroll -= 1;
                 }
+                self.log_autoscroll = false;
+            }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(delta);
+                self.log_autoscroll = false;
+            }
+            KeyCode::PageUp => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(-delta);
                 self.log_autoscroll = false;
             }
             KeyCode::Char('G' | 'f') => {
@@ -1621,7 +2137,8 @@ impl App {
             self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(delta.unsigned_abs());
             self.log_autoscroll = false;
         } else {
-            self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
+            self.sandbox_log_scroll =
+                (self.sandbox_log_scroll + delta.cast_unsigned()).min(max_scroll);
         }
         let visible = filtered_len
             .saturating_sub(self.sandbox_log_scroll)
@@ -1689,11 +2206,9 @@ impl App {
                     CreateFormField::Image => Self::handle_text_input(&mut form.image, key),
                     CreateFormField::Command => Self::handle_text_input(&mut form.command, key),
                     CreateFormField::Providers => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !form.providers.is_empty() {
-                                form.provider_cursor =
-                                    (form.provider_cursor + 1).min(form.providers.len() - 1);
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !form.providers.is_empty() => {
+                            form.provider_cursor =
+                                (form.provider_cursor + 1).min(form.providers.len() - 1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             form.provider_cursor = form.provider_cursor.saturating_sub(1);
@@ -1792,10 +2307,8 @@ impl App {
                 KeyCode::Esc => {
                     self.create_provider_form = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if !form.types.is_empty() {
-                        form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
-                    }
+                KeyCode::Char('j') | KeyCode::Down if !form.types.is_empty() => {
+                    form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
@@ -1836,7 +2349,7 @@ impl App {
                     form.status = None;
                     form.warning = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                     form.method_cursor = 1 - form.method_cursor;
                 }
                 KeyCode::Enter => {
@@ -2008,9 +2521,49 @@ impl App {
     // ------------------------------------------------------------------
 
     fn handle_provider_detail_key(&mut self, key: KeyEvent) {
+        let Some(detail) = self.provider_detail.as_mut() else {
+            return;
+        };
         match key.code {
+            KeyCode::Esc if detail.show_raw_profile || detail.show_raw_provider => {
+                detail.show_raw_profile = false;
+                detail.show_raw_provider = false;
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 self.provider_detail = None;
+            }
+            KeyCode::Char('y') if detail.raw_profile_yaml.is_some() => {
+                detail.show_raw_profile = !detail.show_raw_profile;
+                detail.show_raw_provider = false;
+                detail.raw_profile_scroll = 0;
+            }
+            KeyCode::Char('o') => {
+                detail.show_raw_provider = !detail.show_raw_provider;
+                detail.show_raw_profile = false;
+                detail.raw_provider_scroll = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down if detail.show_raw_profile => {
+                let max_scroll = detail
+                    .raw_profile_yaml
+                    .as_ref()
+                    .map_or(0, |raw| raw.lines().count().saturating_sub(1));
+                detail.raw_profile_scroll = (detail.raw_profile_scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if detail.show_raw_profile => {
+                detail.raw_profile_scroll = detail.raw_profile_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down if detail.show_raw_provider => {
+                let max_scroll = detail.raw_provider_yaml.lines().count().saturating_sub(1);
+                detail.raw_provider_scroll = (detail.raw_provider_scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if detail.show_raw_provider => {
+                detail.raw_provider_scroll = detail.raw_provider_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                detail.summary_scroll = detail.summary_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                detail.summary_scroll = detail.summary_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -2042,7 +2595,7 @@ impl App {
             registry
                 .credential_env_vars(&ptype)
                 .first()
-                .map_or(String::new(), |s| s.to_string())
+                .map_or(String::new(), ToString::to_string)
         } else {
             cred_key
         };
@@ -2139,11 +2692,233 @@ impl App {
             .map(String::as_str)
     }
 
+    /// Get the workspace of the currently selected sandbox.
+    ///
+    /// In the all-workspaces view, returns the workspace from the selected row
+    /// rather than the globally active workspace.
+    pub fn selected_sandbox_workspace(&self) -> String {
+        self.sandbox_workspaces
+            .get(self.sandbox_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
+    /// Get the workspace of the currently selected provider row.
+    pub fn selected_provider_workspace(&self) -> String {
+        self.provider_workspaces
+            .get(self.provider_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
     /// Get the name of the currently selected provider.
     pub fn selected_provider_name(&self) -> Option<&str> {
         self.provider_names
             .get(self.provider_selected)
             .map(String::as_str)
+    }
+
+    pub fn provider_detail_from_provider(
+        &self,
+        provider: &openshell_core::proto::Provider,
+    ) -> ProviderDetailView {
+        let profile = self
+            .provider_entries
+            .iter()
+            .find(|entry| provider_id(&entry.provider) == provider_id(provider))
+            .and_then(|entry| entry.profile.as_ref());
+
+        let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+        credential_keys.sort();
+        let credential_lines = profile.map_or_else(
+            || {
+                if credential_keys.is_empty() {
+                    return vec!["<none>".to_string()];
+                }
+                credential_keys
+                    .iter()
+                    .map(|key| {
+                        let masked = provider
+                            .credentials
+                            .get(key)
+                            .map_or_else(|| "-".to_string(), |value| mask_secret(value));
+                        let expiry = provider
+                            .credential_expires_at_ms
+                            .get(key)
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .map_or_else(String::new, |value| format!(" expires={value}"));
+                        format!("{key}: {masked}{expiry}")
+                    })
+                    .collect()
+            },
+            |profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .map(|credential| {
+                        let present_key = credential
+                            .env_vars
+                            .iter()
+                            .find(|key| provider.credentials.contains_key(*key));
+                        let status = present_key.map_or("missing", |_| "present");
+                        let required = if credential.required {
+                            "required"
+                        } else {
+                            "optional"
+                        };
+                        let env_vars = if credential.env_vars.is_empty() {
+                            "<none>".to_string()
+                        } else {
+                            credential.env_vars.join(", ")
+                        };
+                        let expiry = present_key
+                            .and_then(|key| provider.credential_expires_at_ms.get(key))
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .map_or_else(String::new, |value| format!(" expires={value}"));
+                        format!(
+                            "{} ({required}) env=[{env_vars}] {status}{expiry}",
+                            credential.name
+                        )
+                    })
+                    .collect()
+            },
+        );
+
+        let mut config_lines = provider.config.keys().cloned().collect::<Vec<_>>();
+        config_lines.sort();
+        if config_lines.is_empty() {
+            config_lines.push("<none>".to_string());
+        }
+
+        let policy_lines = profile.map_or_else(
+            || vec!["No provider profile found; no v2 policy metadata.".to_string()],
+            |profile| {
+                let mut lines = profile
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        let protocol = if endpoint.protocol.is_empty() {
+                            "l4"
+                        } else {
+                            endpoint.protocol.as_str()
+                        };
+                        let access = if endpoint.access.is_empty() {
+                            if endpoint.rules.is_empty() {
+                                "custom"
+                            } else {
+                                "rules"
+                            }
+                        } else {
+                            endpoint.access.as_str()
+                        };
+                        let path = if endpoint.path.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" path={}", endpoint.path)
+                        };
+                        format!(
+                            "{}:{} {protocol} {access}{path}",
+                            endpoint.host, endpoint.port
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push("No profile endpoints.".to_string());
+                }
+                if !profile.binaries.is_empty() {
+                    lines.push(format!("Binaries: {}", profile.binaries.len()));
+                    lines.extend(
+                        profile
+                            .binaries
+                            .iter()
+                            .take(4)
+                            .map(|binary| format!("  {}", binary.path)),
+                    );
+                    if profile.binaries.len() > 4 {
+                        lines.push(format!("  ... {} more", profile.binaries.len() - 4));
+                    }
+                }
+                lines
+            },
+        );
+
+        let discovery_lines = profile.map_or_else(
+            || vec!["<none>".to_string()],
+            |profile| {
+                if let Some(discovery) = &profile.discovery
+                    && !discovery.credentials.is_empty()
+                {
+                    discovery.credentials.clone()
+                } else {
+                    vec!["<none>".to_string()]
+                }
+            },
+        );
+
+        let refresh_lines = profile.map_or_else(
+            || vec!["No profile refresh metadata.".to_string()],
+            |profile| {
+                let lines = profile
+                    .credentials
+                    .iter()
+                    .filter_map(|credential| {
+                        credential.refresh.as_ref().map(|refresh| {
+                            format!(
+                                "{}: {} scopes=[{}] material={} key{}",
+                                credential.name,
+                                refresh_strategy_label(refresh.strategy),
+                                refresh.scopes.join(", "),
+                                refresh.material.len(),
+                                plural(refresh.material.len())
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    vec!["No refresh metadata in profile.".to_string()]
+                } else {
+                    lines
+                }
+            },
+        );
+
+        let raw_profile_yaml = profile.and_then(|profile| {
+            let dto = openshell_providers::ProviderTypeProfile::from_proto(profile);
+            openshell_providers::profile_to_yaml(&dto).ok()
+        });
+
+        ProviderDetailView {
+            name: provider_name(provider).to_string(),
+            provider_id: provider_id(provider).to_string(),
+            provider_type: provider.r#type.clone(),
+            resource_version: provider_resource_version(provider),
+            summary_scroll: 0,
+            show_raw_profile: false,
+            show_raw_provider: false,
+            raw_profile_scroll: 0,
+            raw_provider_scroll: 0,
+            raw_profile_yaml,
+            raw_provider_yaml: provider_to_redacted_yaml(provider),
+            profile_name: profile.map(|profile| {
+                if profile.display_name.is_empty() {
+                    profile.id.clone()
+                } else {
+                    profile.display_name.clone()
+                }
+            }),
+            profile_category: profile
+                .map(|profile| provider_category_label(profile.category).to_string()),
+            profile_description: profile.and_then(|profile| {
+                (!profile.description.is_empty()).then(|| profile.description.clone())
+            }),
+            credential_lines,
+            config_lines,
+            policy_lines,
+            discovery_lines,
+            refresh_lines,
+        }
     }
 
     pub fn log_autoscroll_offset(&self) -> usize {
@@ -2182,7 +2957,10 @@ impl App {
         self.sandbox_created.clear();
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
+        self.sandbox_labels.clear();
+        self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
+        self.sandbox_workspaces.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
@@ -2197,9 +2975,12 @@ impl App {
         self.policy_lines.clear();
         self.policy_scroll = 0;
         // Reset provider state too.
+        self.providers_v2_enabled = false;
+        self.provider_entries.clear();
         self.provider_names.clear();
         self.provider_types.clear();
         self.provider_cred_keys.clear();
+        self.provider_workspaces.clear();
         self.provider_selected = 0;
         self.provider_count = 0;
         self.confirm_provider_delete = false;
@@ -2223,4 +3004,171 @@ fn unique_provider_name(base: &str, existing: &[String]) -> String {
         }
     }
     base.to_string()
+}
+
+/// Compute a new scroll position after applying `delta`, clamped so the last
+/// viewport of content remains visible.
+///
+/// * `current` - current scroll offset
+/// * `delta`   - lines to scroll (positive = down, negative = up)
+/// * `total`   - total number of lines/items
+/// * `viewport` - visible line count (0 before first draw, treated as 1)
+fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -> usize {
+    let max = total.saturating_sub(viewport.max(1));
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        let stepped = current + delta as usize;
+        stepped.min(max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_bootstrap::GatewayMetadataSource;
+
+    // -- clamped_scroll -------------------------------------------------
+
+    #[test]
+    fn scroll_empty_content() {
+        // No lines at all: scroll should stay at 0 regardless of delta.
+        assert_eq!(clamped_scroll(0, 1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, 20, 0, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_shorter_than_viewport() {
+        // 5 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 5, 10), 0);
+        assert_eq!(clamped_scroll(0, 5, 5, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_equals_viewport() {
+        // Exactly 10 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 10, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 10, 10), 0);
+    }
+
+    #[test]
+    fn scroll_down_one() {
+        // 100 lines, viewport 20, start at 0: scroll to 1.
+        assert_eq!(clamped_scroll(0, 1, 100, 20), 1);
+    }
+
+    #[test]
+    fn scroll_page_down() {
+        // 100 lines, viewport 20, start at 0: scroll to 20.
+        assert_eq!(clamped_scroll(0, 20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_down_clamps_at_bottom() {
+        // 100 lines, viewport 20: max scroll = 80.
+        assert_eq!(clamped_scroll(75, 20, 100, 20), 80);
+        assert_eq!(clamped_scroll(80, 20, 100, 20), 80);
+    }
+
+    #[test]
+    fn scroll_page_up_from_middle() {
+        assert_eq!(clamped_scroll(40, -20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_up_clamps_at_top() {
+        // Scrolling up past 0 saturates to 0.
+        assert_eq!(clamped_scroll(5, -20, 100, 20), 0);
+        assert_eq!(clamped_scroll(0, -1, 100, 20), 0);
+    }
+
+    #[test]
+    fn scroll_viewport_zero_before_first_draw() {
+        // viewport=0 is treated as 1 (the .max(1) fallback).
+        // 100 lines, viewport 0 -> max = 99.
+        assert_eq!(clamped_scroll(0, 1, 100, 0), 1);
+        assert_eq!(clamped_scroll(98, 5, 100, 0), 99);
+    }
+
+    #[test]
+    fn scroll_up_one() {
+        assert_eq!(clamped_scroll(10, -1, 100, 20), 9);
+    }
+
+    #[test]
+    fn gateway_entry_source_label_formats_known_sources() {
+        let user_gateway = GatewayEntry {
+            name: "user-gw".to_string(),
+            endpoint: "https://user.example.com".to_string(),
+            is_remote: true,
+            source: Some(GatewayMetadataSource::User),
+        };
+        let system_gateway = GatewayEntry {
+            name: "system-gw".to_string(),
+            endpoint: "http://127.0.0.1:17670".to_string(),
+            is_remote: false,
+            source: Some(GatewayMetadataSource::System),
+        };
+
+        assert_eq!(user_gateway.source_label(), "user");
+        assert_eq!(system_gateway.source_label(), "system");
+    }
+
+    #[test]
+    fn gateway_entry_source_label_handles_unknown_source() {
+        let gateway = GatewayEntry {
+            name: "mystery".to_string(),
+            endpoint: "https://mystery.example.com".to_string(),
+            is_remote: true,
+            source: None,
+        };
+
+        assert_eq!(gateway.source_label(), "unknown");
+    }
+
+    // -- selected_sandbox_workspace ----------------------------------------
+
+    #[test]
+    fn selected_sandbox_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_sandbox_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
+    }
+
+    // -- selected_provider_workspace ----------------------------------------
+
+    #[test]
+    fn selected_provider_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_provider_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
+    }
 }

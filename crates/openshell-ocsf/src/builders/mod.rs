@@ -6,6 +6,148 @@
 //! Each event class has a builder that takes a `SandboxContext` reference
 //! and provides chainable methods for setting event fields.
 
+/// Generate the shared `severity`, `status`, and `message` setter methods that
+/// appear identically on every OCSF event builder in this crate.
+///
+/// # Usage
+/// ```ignore
+/// impl_builder_setters!(MyBuilder);            // severity + status + message
+/// impl_builder_setters!(MyBuilder, no_status); // severity + message only
+/// ```
+macro_rules! impl_builder_setters {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the event severity.
+            #[must_use]
+            pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
+                self.severity = id;
+                self
+            }
+            /// Set the overall event status.
+            #[must_use]
+            pub fn status(mut self, id: $crate::enums::StatusId) -> Self {
+                self.status = Some(id);
+                self
+            }
+            /// Set a human-readable event message.
+            #[must_use]
+            pub fn message(mut self, msg: impl Into<String>) -> Self {
+                self.message = Some(msg.into());
+                self
+            }
+        }
+    };
+    ($builder:ident, no_status) => {
+        impl<'a> $builder<'a> {
+            /// Set the event severity.
+            #[must_use]
+            pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
+                self.severity = id;
+                self
+            }
+            /// Set a human-readable event message.
+            #[must_use]
+            pub fn message(mut self, msg: impl Into<String>) -> Self {
+                self.message = Some(msg.into());
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `activity` setter used by every event builder that carries an
+/// `activity` field.
+macro_rules! impl_activity_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the event activity identifier.
+            #[must_use]
+            pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
+                self.activity = id;
+                self
+            }
+        }
+    };
+}
+
+/// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
+/// process, and detection-finding builders.
+macro_rules! impl_action_disposition_setters {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the action taken.
+            #[must_use]
+            pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
+                self.action = Some(id);
+                self
+            }
+            /// Set the disposition of the action.
+            #[must_use]
+            pub fn disposition(mut self, id: $crate::enums::DispositionId) -> Self {
+                self.disposition = Some(id);
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `actor_process` setter shared by network, HTTP, SSH, and
+/// process-activity builders.
+macro_rules! impl_actor_process_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the acting process.
+            #[must_use]
+            pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
+                self.actor = Some($crate::objects::Actor { process });
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `dst_endpoint` setter shared by network, HTTP, and SSH builders.
+macro_rules! impl_dst_endpoint_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the destination endpoint.
+            #[must_use]
+            pub fn dst_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
+                self.dst_endpoint = Some(endpoint);
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `src_endpoint_addr` setter shared by network and SSH builders.
+macro_rules! impl_src_endpoint_addr_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the source endpoint from a raw IP address and port.
+            #[must_use]
+            pub fn src_endpoint_addr(mut self, ip: std::net::IpAddr, port: u16) -> Self {
+                self.src_endpoint = Some($crate::objects::Endpoint::from_ip(ip, port));
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `firewall_rule` setter shared by network and HTTP builders.
+macro_rules! impl_firewall_rule_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the firewall rule that matched this event.
+            #[must_use]
+            pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
+                self.firewall_rule = Some($crate::objects::FirewallRule::new(name, rule_type));
+                self
+            }
+        }
+    };
+}
+
 mod base;
 mod config;
 mod finding;
@@ -27,6 +169,8 @@ pub use ssh::SshActivityBuilder;
 use std::net::IpAddr;
 
 use crate::OCSF_VERSION;
+use crate::enums::StatusId;
+use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 
 /// Immutable context created once at sandbox startup.
@@ -86,6 +230,24 @@ impl SandboxContext {
     #[must_use]
     pub fn proxy_endpoint(&self) -> Endpoint {
         Endpoint::from_ip(self.proxy_ip, self.proxy_port)
+    }
+
+    /// Apply the fields common to every builder's `build()` method onto `base`:
+    /// optional status, optional message, device info, and container info.
+    pub fn apply_common_fields(
+        &self,
+        base: &mut BaseEventData,
+        status: Option<StatusId>,
+        message: Option<String>,
+    ) {
+        if let Some(s) = status {
+            base.set_status(s);
+        }
+        if let Some(m) = message {
+            base.set_message(m);
+        }
+        base.set_device(self.device());
+        base.set_container(self.container());
     }
 }
 

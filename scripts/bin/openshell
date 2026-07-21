@@ -5,14 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$PROJECT_ROOT/target/debug/openshell"
 STATE_FILE="$PROJECT_ROOT/.cache/openshell-build.state"
+CALLER_PWD="$PWD"
 
 # ---------------------------------------------------------------------------
 # Fingerprint-based rebuild check
 #
-# Mirrors the approach in tasks/scripts/cluster-deploy-fast.sh: collect dirty
-# files from git, filter to paths in the openshell-cli dependency closure,
-# hash their contents, and compare against a persisted state file.  We also
-# track HEAD so that branch switches / pulls are detected.
+# Collect dirty files from git, filter to paths in the openshell-cli dependency
+# closure, hash their contents, and compare against a persisted state file. We
+# also track HEAD so that branch switches / pulls are detected.
 # ---------------------------------------------------------------------------
 
 needs_build=0
@@ -26,7 +26,10 @@ else
   current_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
   # Collect dirty (modified, staged, untracked) files
-  mapfile -t changed_files < <(
+  changed_files=()
+  while IFS= read -r path; do
+    changed_files+=("$path")
+  done < <(
     {
       git diff --name-only 2>/dev/null
       git diff --name-only --cached 2>/dev/null
@@ -106,11 +109,6 @@ if [[ "$needs_build" == "1" ]]; then
         break
       fi
     done
-
-    if [[ -z "${Z3_SYS_Z3_HEADER:-}" ]]; then
-      echo "Falling back to bundled Z3 for local CLI build." >&2
-      build_args+=(--features bundled-z3)
-    fi
   fi
   cargo build "${build_args[@]}"
   # Persist state after successful build
@@ -118,7 +116,10 @@ if [[ "$needs_build" == "1" ]]; then
   cd "$PROJECT_ROOT"
   new_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
   # Recompute fingerprint of remaining dirty files (build may not change them)
-  mapfile -t post_files < <(
+  post_files=()
+  while IFS= read -r path; do
+    post_files+=("$path")
+  done < <(
     {
       git diff --name-only 2>/dev/null
       git diff --name-only --cached 2>/dev/null
@@ -165,4 +166,5 @@ fingerprint=${new_fingerprint}
 EOF
 fi
 
+cd "$CALLER_PWD"
 exec "$BINARY" "$@"

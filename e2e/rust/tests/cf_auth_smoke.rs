@@ -21,6 +21,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -44,6 +45,7 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         // Suppress browser popup during auth flow.
         .env("OPENSHELL_NO_BROWSER", "1")
         // Use a closed stdin so auth prompts don't hang the test.
@@ -60,20 +62,22 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
 }
 
 // -------------------------------------------------------------------
-// Test 8: `--plaintext` flag is recognized
+// Test 8: gateway lifecycle commands are not exposed through the CLI
 // -------------------------------------------------------------------
 
-/// `openshell gateway start --help` must show `--plaintext`.
+/// `openshell gateway --help` must not show removed lifecycle commands.
 #[tokio::test]
-async fn gateway_start_help_shows_plaintext() {
-    let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
-    assert_eq!(code, 0, "gateway start --help should exit 0:\n{output}");
+async fn gateway_help_omits_lifecycle_commands() {
+    let (output, code) = run_isolated(&["gateway", "--help"]).await;
+    assert_eq!(code, 0, "gateway --help should exit 0:\n{output}");
 
     let clean = strip_ansi(&output);
-    assert!(
-        clean.contains("--plaintext"),
-        "expected '--plaintext' in gateway start --help output:\n{clean}"
-    );
+    for removed in ["start", "stop", "destroy"] {
+        assert!(
+            !clean.contains(removed),
+            "did not expect removed gateway lifecycle command '{removed}' in gateway help:\n{clean}"
+        );
+    }
 }
 
 // -------------------------------------------------------------------
@@ -113,10 +117,6 @@ async fn gateway_add_help_shows_flags() {
         "expected '--remote' in gateway add --help:\n{clean}"
     );
     assert!(
-        clean.contains("--ssh-key"),
-        "expected '--ssh-key' in gateway add --help:\n{clean}"
-    );
-    assert!(
         clean.contains("--local"),
         "expected '--local' in gateway add --help:\n{clean}"
     );
@@ -136,8 +136,10 @@ async fn gateway_login_help_is_recognized() {
     let clean = strip_ansi(&output);
     // Should mention authenticating or Cloudflare
     assert!(
-        clean.to_lowercase().contains("authenticat") || clean.to_lowercase().contains("cloudflare")
-            || clean.to_lowercase().contains("login") || clean.to_lowercase().contains("browser"),
+        clean.to_lowercase().contains("authenticat")
+            || clean.to_lowercase().contains("cloudflare")
+            || clean.to_lowercase().contains("login")
+            || clean.to_lowercase().contains("browser"),
         "expected auth-related text in gateway login --help:\n{clean}"
     );
 }
@@ -147,7 +149,7 @@ async fn gateway_login_help_is_recognized() {
 // -------------------------------------------------------------------
 
 /// `openshell gateway add <endpoint>` (cloud gateway) should:
-/// - Create cluster metadata with auth_mode = "cloudflare_jwt"
+/// - Create cluster metadata with `auth_mode` = `"cloudflare_jwt"`
 /// - Set the gateway as active
 /// - Attempt browser authentication (which will fail in CI — non-fatal)
 #[tokio::test]
@@ -210,10 +212,7 @@ async fn gateway_add_creates_cf_metadata() {
     );
 
     // Verify the gateway was set as active.
-    let active_path = tmpdir
-        .path()
-        .join("openshell")
-        .join("active_gateway");
+    let active_path = tmpdir.path().join("openshell").join("active_gateway");
     assert!(
         active_path.exists(),
         "active_gateway file should exist at {}",
@@ -241,18 +240,11 @@ async fn gateway_add_derives_name_from_hostname() {
 
     let (output, code) = run_with_config(
         tmpdir.path(),
-        &[
-            "gateway",
-            "add",
-            "https://my-special-gateway.brevlab.com",
-        ],
+        &["gateway", "add", "https://my-special-gateway.brevlab.com"],
     )
     .await;
 
-    assert_eq!(
-        code, 0,
-        "gateway add should exit 0:\n{output}"
-    );
+    assert_eq!(code, 0, "gateway add should exit 0:\n{output}");
 
     // The derived name should be the hostname.
     let metadata_path = tmpdir
@@ -291,9 +283,9 @@ async fn gateway_add_remote_and_local_conflict() {
     );
 }
 
-/// `--ssh-key` requires `--remote`.
+/// `--ssh-key` was removed from `gateway add`.
 #[tokio::test]
-async fn gateway_add_ssh_key_requires_remote() {
+async fn gateway_add_rejects_removed_ssh_key_flag() {
     let (output, code) = run_isolated(&[
         "gateway",
         "add",
@@ -305,7 +297,7 @@ async fn gateway_add_ssh_key_requires_remote() {
 
     assert_ne!(
         code, 0,
-        "--ssh-key without --remote should fail:\n{output}"
+        "--ssh-key should fail after gateway lifecycle bootstrap removal:\n{output}"
     );
 }
 
@@ -344,10 +336,7 @@ async fn gateway_add_rejects_duplicate_name() {
         ],
     )
     .await;
-    assert_ne!(
-        code, 0,
-        "duplicate gateway add should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "duplicate gateway add should fail:\n{output}");
 
     let clean = strip_ansi(&output);
     assert!(
@@ -363,18 +352,9 @@ async fn gateway_add_rejects_duplicate_name() {
 /// `ssh://` endpoint with `--local` should fail.
 #[tokio::test]
 async fn gateway_add_ssh_url_conflicts_with_local() {
-    let (output, code) = run_isolated(&[
-        "gateway",
-        "add",
-        "ssh://user@host:8080",
-        "--local",
-    ])
-    .await;
+    let (output, code) = run_isolated(&["gateway", "add", "ssh://user@host:8080", "--local"]).await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// with --local should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// with --local should fail:\n{output}");
 }
 
 /// `ssh://` endpoint with `--remote` should fail (redundant).
@@ -389,26 +369,15 @@ async fn gateway_add_ssh_url_conflicts_with_remote() {
     ])
     .await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// with --remote should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// with --remote should fail:\n{output}");
 }
 
 /// `ssh://` endpoint without a port should fail.
 #[tokio::test]
 async fn gateway_add_ssh_url_requires_port() {
-    let (output, code) = run_isolated(&[
-        "gateway",
-        "add",
-        "ssh://user@host",
-    ])
-    .await;
+    let (output, code) = run_isolated(&["gateway", "add", "ssh://user@host"]).await;
 
-    assert_ne!(
-        code, 0,
-        "ssh:// without port should fail:\n{output}"
-    );
+    assert_ne!(code, 0, "ssh:// without port should fail:\n{output}");
 
     let clean = strip_ansi(&output);
     assert!(
@@ -416,4 +385,3 @@ async fn gateway_add_ssh_url_requires_port() {
         "error should mention port:\n{clean}"
     );
 }
-

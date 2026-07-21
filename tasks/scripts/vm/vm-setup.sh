@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# One-time setup for the openshell-vm runtime.
+# One-time setup for the openshell-driver-vm runtime.
 #
-# Downloads pre-built runtime artifacts (libkrun, libkrunfw, gvproxy) from the
-# vm-dev GitHub Release, or builds them from source when --from-source is set.
+# Downloads pre-built runtime artifacts (libkrun, libkrunfw, gvproxy, umoci)
+# from the vm-runtime GitHub Release, or builds them from source when
+# --from-source is set.
 # After obtaining the runtime, compresses the artifacts for embedding into the
-# openshell-vm binary.
+# openshell-driver-vm binary.
 #
 # Usage:
 #   ./vm-setup.sh                   # download pre-built (default, ~30s)
@@ -21,6 +22,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
+CLI_BIN="${ROOT}/scripts/bin/openshell"
 
 FROM_SOURCE="${FROM_SOURCE:-0}"
 
@@ -33,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--from-source]"
             echo ""
-            echo "Set up the openshell-vm runtime (libkrun, libkrunfw, gvproxy)."
+            echo "Set up the openshell-driver-vm runtime (libkrun, libkrunfw, gvproxy, umoci)."
             echo ""
             echo "Options:"
             echo "  --from-source   Build runtime from source instead of downloading (~15-45min)"
@@ -51,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 PLATFORM="$(detect_platform)"
-echo "==> openshell-vm setup"
+echo "==> openshell-driver-vm setup"
 echo "    Platform: ${PLATFORM}"
 echo "    Mode:     $([ "$FROM_SOURCE" = "1" ] && echo "build from source" || echo "download pre-built")"
 echo ""
@@ -99,7 +101,7 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 missing=0
 case "$PLATFORM" in
     darwin-aarch64)
-        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst; do
+        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1
@@ -107,7 +109,7 @@ case "$PLATFORM" in
         done
         ;;
     linux-aarch64|linux-x86_64)
-        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst; do
+        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1
@@ -126,6 +128,6 @@ echo ""
 echo "==> Setup complete!"
 echo "    Compressed artifacts in: ${OUTPUT_DIR}"
 echo ""
-echo "Next steps:"
-echo "  mise run vm:rootfs --base   # build rootfs (requires Docker)"
-echo "  mise run vm                 # build and run the VM"
+echo "After starting the gateway:"
+echo "  ${CLI_BIN} status"
+echo "  ${CLI_BIN} sandbox create --name vm-test --from ubuntu:24.04"

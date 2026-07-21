@@ -20,8 +20,8 @@ pub enum Event {
     Resize(u16, u16),
     /// A batch of log lines from the streaming log task.
     LogLines(Vec<LogLine>),
-    /// Result of a create sandbox request: `Ok(name)` or `Err(message)`.
-    CreateResult(Result<String, String>),
+    /// Result of a create sandbox request: `Ok((name, workspace))` or `Err(message)`.
+    CreateResult(Result<(String, String), String>),
     /// Result of creating a provider on the gateway: `Ok(name)` or `Err(message)`.
     ProviderCreateResult(Result<String, String>),
     /// Provider detail fetched from gateway.
@@ -51,12 +51,14 @@ pub enum Event {
     SandboxSettingSetResult(Result<u64, String>),
     /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
     SandboxSettingDeleteResult(Result<u64, String>),
+    /// Non-fatal warnings from port-forward setup after sandbox creation.
+    ForwardWarnings(Vec<String>),
 }
 
 pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     // Kept alive so the spawned task's `tx` doesn't see a closed channel.
-    _keepalive: mpsc::UnboundedSender<Event>,
+    keepalive: mpsc::UnboundedSender<Event>,
     /// When true, the background reader stops polling stdin.
     paused: Arc<AtomicBool>,
 }
@@ -85,20 +87,14 @@ impl EventHandler {
 
                 if event::poll(poll_interval).unwrap_or(false) {
                     match event::read() {
-                        Ok(TermEvent::Key(key)) => {
-                            if tx.send(Event::Key(key)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Key(key)) if tx.send(Event::Key(key)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Mouse(mouse)) => {
-                            if tx.send(Event::Mouse(mouse)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Mouse(mouse)) if tx.send(Event::Mouse(mouse)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Resize(w, h)) => {
-                            if tx.send(Event::Resize(w, h)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Resize(w, h)) if tx.send(Event::Resize(w, h)).is_err() => {
+                            return;
                         }
                         _ => {}
                     }
@@ -113,7 +109,7 @@ impl EventHandler {
 
         Self {
             rx,
-            _keepalive: keepalive,
+            keepalive,
             paused,
         }
     }
@@ -122,9 +118,18 @@ impl EventHandler {
         self.rx.recv().await
     }
 
+    /// Discard events queued before or while the TUI was suspended.
+    ///
+    /// The input reader is paused before this is called, so terminal input
+    /// remains in the TTY for the resumed reader. This primarily removes stale
+    /// tick events that would otherwise run refresh work before new key input.
+    pub fn discard_pending(&mut self) {
+        while self.rx.try_recv().is_ok() {}
+    }
+
     /// Get a sender handle for dispatching events from background tasks.
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
-        self._keepalive.clone()
+        self.keepalive.clone()
     }
 
     /// Pause stdin polling (call before suspending TUI for a child process).

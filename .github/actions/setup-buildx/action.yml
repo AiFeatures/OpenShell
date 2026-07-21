@@ -1,30 +1,31 @@
 name: Setup Docker Buildx
 description: >
-  Create a multi-arch Docker Buildx builder using remote BuildKit nodes.
-  The builder is automatically removed when the job finishes (cleanup is
-  enabled by default in docker/setup-buildx-action).
+  Create a Docker Buildx builder on the local docker-container driver. Pair
+  with cache-to/cache-from=type=gha on build steps for persistence. Works on
+  nv-gha-runners; no EKS BuildKit service is required.
+  Cleanup is automatic when the job finishes (docker/setup-buildx-action default).
 
 inputs:
-  amd64-endpoint:
-    description: BuildKit endpoint for linux/amd64
-    default: tcp://buildkit-amd64.buildkit:1234
-  arm64-endpoint:
-    description: BuildKit endpoint for linux/arm64
-    default: tcp://buildkit-arm64.buildkit:1234
   name:
     description: Builder instance name
     default: openshell
+  buildkitd-config:
+    description: >
+      Path to a buildkitd.toml to configure the builder with (e.g. the
+      nv-gha-runners Docker Hub mirror at /etc/buildkit/buildkitd.toml).
+      Must be readable *from where this action runs* — in a containerized
+      job that means the caller must bind-mount the host path into the job
+      container (e.g. `volumes: [/etc/buildkit:/etc/buildkit:ro]`). Empty
+      disables the config (default).
+    default: ""
 
 runs:
   using: composite
   steps:
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+    - name: Set up Docker Buildx (local)
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       with:
         name: ${{ inputs.name }}
-        driver: remote
-        endpoint: ${{ inputs.amd64-endpoint }}
-        platforms: linux/amd64
-        append: |
-          - endpoint: ${{ inputs.arm64-endpoint }}
-            platforms: linux/arm64
+        driver: docker-container
+        platforms: linux/amd64,linux/arm64
+        buildkitd-config: ${{ inputs.buildkitd-config }}

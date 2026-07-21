@@ -34,7 +34,7 @@ pub struct RouteConfig {
 /// A fully-resolved route ready for the router to forward requests.
 ///
 /// The router is provider-agnostic — all provider-specific decisions
-/// (auth header style, default headers, base URL) are made by the
+/// (auth header style, default headers, passthrough headers, base URL) are made by the
 /// caller during resolution.
 #[derive(Clone)]
 pub struct ResolvedRoute {
@@ -48,8 +48,15 @@ pub struct ResolvedRoute {
     pub auth: AuthHeader,
     /// Extra headers injected on every request (e.g. `anthropic-version`).
     pub default_headers: Vec<(String, String)>,
+    /// Client-supplied headers that may be forwarded to the upstream backend.
+    pub passthrough_headers: Vec<String>,
     /// Per-request timeout for proxied inference calls.
     pub timeout: Duration,
+    /// When true, the model identifier is embedded in the URL path (e.g. Vertex AI).
+    pub model_in_path: bool,
+    /// Optional override for the request path. When set, replaces the protocol-derived path.
+    /// An empty string means POST directly to `base_url/model_id` with no additional path.
+    pub request_path_override: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedRoute {
@@ -62,7 +69,10 @@ impl std::fmt::Debug for ResolvedRoute {
             .field("protocols", &self.protocols)
             .field("auth", &self.auth)
             .field("default_headers", &self.default_headers)
+            .field("passthrough_headers", &self.passthrough_headers)
             .field("timeout", &self.timeout)
+            .field("model_in_path", &self.model_in_path)
+            .field("request_path_override", &self.request_path_override)
             .finish()
     }
 }
@@ -125,7 +135,8 @@ impl RouteConfig {
             )));
         }
 
-        let (auth, default_headers) = auth_from_provider_type(self.provider_type.as_deref());
+        let (auth, default_headers, passthrough_headers) =
+            route_headers_from_provider_type(self.provider_type.as_deref(), &protocols);
 
         Ok(ResolvedRoute {
             name: self.name.clone(),
@@ -135,17 +146,24 @@ impl RouteConfig {
             protocols,
             auth,
             default_headers,
+            passthrough_headers,
             timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         })
     }
 }
 
-/// Derive auth header style and default headers from a provider type string.
+/// Derive auth header style, default headers, and passthrough headers from a
+/// provider type string.
 ///
-/// Delegates to [`openshell_core::inference::auth_for_provider_type`] which
-/// uses the centralized `InferenceProviderProfile` registry.
-fn auth_from_provider_type(provider_type: Option<&str>) -> (AuthHeader, Vec<(String, String)>) {
-    openshell_core::inference::auth_for_provider_type(provider_type.unwrap_or(""))
+/// Delegates to [`openshell_core::inference::route_headers_for_provider_type`]
+/// which uses the centralized `InferenceProviderProfile` registry.
+fn route_headers_from_provider_type(
+    provider_type: Option<&str>,
+    protocols: &[String],
+) -> (AuthHeader, Vec<(String, String)>, Vec<String>) {
+    openshell_core::inference::route_headers_for_route(provider_type.unwrap_or(""), protocols)
 }
 
 #[cfg(test)]
@@ -155,7 +173,7 @@ mod tests {
 
     #[test]
     fn load_from_file_valid_yaml_round_trip() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
@@ -167,7 +185,7 @@ routes:
     model: gpt-4o
     protocols: [openai_chat_completions, anthropic_messages]
     api_key: sk-prod-key
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
 
@@ -200,13 +218,13 @@ routes:
 
     #[test]
     fn load_from_file_missing_api_key_returns_error() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
 
@@ -223,15 +241,16 @@ routes:
     }
 
     #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
     fn load_from_file_api_key_env_resolves_from_environment() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
     api_key_env: NAV_TEST_API_KEY_FOR_YAML_TEST
-"#;
+";
         // SAFETY: this test runs single-threaded; no other thread reads this var.
         unsafe { std::env::set_var("NAV_TEST_API_KEY_FOR_YAML_TEST", "from-env") };
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -263,7 +282,10 @@ routes:
             protocols: vec!["openai_chat_completions".to_string()],
             auth: AuthHeader::Bearer,
             default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
             timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         };
         let debug_output = format!("{route:?}");
         assert!(
@@ -278,22 +300,49 @@ routes:
 
     #[test]
     fn auth_from_anthropic_provider_uses_custom_header() {
-        let (auth, headers) = auth_from_provider_type(Some("anthropic"));
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("anthropic"),
+            &["anthropic_messages".to_string()],
+        );
         assert_eq!(auth, AuthHeader::Custom("x-api-key"));
         assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
+        assert!(
+            passthrough_headers
+                .iter()
+                .any(|name| name == "anthropic-beta")
+        );
     }
 
     #[test]
     fn auth_from_openai_provider_uses_bearer() {
-        let (auth, headers) = auth_from_provider_type(Some("openai"));
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("openai"),
+            &["openai_chat_completions".to_string()],
+        );
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+        assert!(
+            passthrough_headers
+                .iter()
+                .any(|name| name == "openai-organization")
+        );
     }
 
     #[test]
     fn auth_from_none_defaults_to_bearer() {
-        let (auth, headers) = auth_from_provider_type(None);
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(None, &[]);
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+        assert!(passthrough_headers.is_empty());
+    }
+
+    #[test]
+    fn vertex_anthropic_route_forwards_beta_only() {
+        let (_, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("google-vertex-ai"),
+            &["anthropic_messages".to_string()],
+        );
+        assert!(headers.is_empty());
+        assert_eq!(passthrough_headers, vec!["anthropic-beta".to_string()]);
     }
 }

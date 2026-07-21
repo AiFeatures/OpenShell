@@ -32,7 +32,7 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 
 ### Finding Work
 
-Issues labeled [`good-first-issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+Issues labeled [`good first issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
 
 All open issues are actionable — if it's in the issue tracker, it's ready to be worked on.
 
@@ -41,7 +41,7 @@ All open issues are actionable — if it's in the issue tracker, it's ready to b
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
 
 1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for cluster problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
+2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
 4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
 
@@ -49,7 +49,7 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 
 - A real bug that your agent confirmed and could not fix.
 - A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the `debug-openshell-cluster` skill could not resolve.
+- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
@@ -66,17 +66,22 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
 | Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
-| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues                                                 |
+| Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
+| Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
+| Reviewing       | `fix-security-issue`      | Implement an approved security remediation plan                                                     |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
+| Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
+| Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
+| Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
@@ -92,6 +97,8 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
+New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
+Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity and may be closed after 7 more days without activity. Comment on the item or remove `state:stale` to keep it open. Issues labeled `state:triage-needed` or `roadmap` are exempt from stale handling.
 
 ## Prerequisites
 
@@ -107,6 +114,9 @@ After installing `mise`, activate it with `mise activate` or [add it to your she
 Shell setup examples:
 
 ```bash
+# Bash
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+
 # Fish
 echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 
@@ -116,10 +126,29 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project requirements:
 
-- Rust 1.88+
-- Python 3.12+
+- Rust 1.90+
+- Python 3.11+
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
+
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
+```
+
+If Cargo fails while building `protobuf-src` with an error such as
+`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
+found`, or `A compiler with support for C++11 language features is required`,
+your Command Line Tools install may not expose the libc++ headers on the
+compiler's default include path. Reinstall Command Line Tools to correct the error:
+
+```bash
+sudo rm -rf /Library/Developer/CommandLineTools
+xcode-select --install
+```
 
 ### Z3 installation
 
@@ -148,8 +177,8 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
-# Launch a sandbox (deploys a cluster if one isn't running)
-mise run sandbox
+# Run a standalone gateway for local development
+mise run gateway
 ```
 
 ## Building the `openshell` CLI
@@ -166,37 +195,42 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
-### Cluster debugging helpers
+### Rust build cache
 
-Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
+Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
+to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
+the worktree-local `.cache/sccache` directory. To make cache entries available
+to multiple worktrees on a workstation, set the variable to a user-level
+directory before activating mise. For example:
 
-| Script    | What it does                                                                         |
-| --------- | ------------------------------------------------------------------------------------ |
-| `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
-| `k9s`     | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec`     |
-
-These work for both local and remote gateways (SSH is handled automatically). Examples:
-
-```bash
-kubectl get pods -A
-kubectl logs -n openshell statefulset/openshell
-k9s
-k9s -n openshell
+```shell
+export SCCACHE_DIR="$HOME/.cache/openshell/sccache"
 ```
+
+CI can select a different directory or configure a remote sccache backend
+without changing the workstation setting. Cargo output remains in each
+worktree's `target/` directory.
+
+OpenShell does not set `SCCACHE_BASEDIRS`. Sccache loads base directories when
+its machine-local daemon starts, but the correct workspace root differs for
+each worktree. Cache reuse therefore depends on the compiler inputs: outputs
+that embed absolute paths, including Rust dependencies in some builds, can
+still miss across worktrees.
 
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
 
-| Task               | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run sandbox` | Create a sandbox on the running cluster                 |
-| `mise run test`    | Default test suite                                      |
-| `mise run e2e`     | Default end-to-end test lane                            |
-| `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Validate Fern docs locally                              |
-| `mise run clean`   | Clean build artifacts                                   |
+| Task                 | Purpose                                                 |
+| -------------------- | ------------------------------------------------------- |
+| `mise run gateway`   | Run a standalone gateway for local development          |
+| `mise run sandbox`   | Create or reconnect to the dev sandbox                  |
+| `mise run test`      | Default test suite                                      |
+| `mise run e2e`       | Default end-to-end test lane                            |
+| `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
+| `mise run docs`      | Validate Fern docs locally                              |
+| `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run clean`     | Clean build artifacts                                   |
 
 ## Project Structure
 
@@ -215,7 +249,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## RFCs
 
-For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
+New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines.
 
 ## Documentation
 
@@ -255,7 +289,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -276,7 +310,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 
 **Examples:**
 
-```
+```text
 feat(cli): add --verbose flag to openshell run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
@@ -285,8 +319,14 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/).
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
 
 ```bash
 git commit -s -m "feat(sandbox): add new capability"
 ```
+
+DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+## CI
+
+How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

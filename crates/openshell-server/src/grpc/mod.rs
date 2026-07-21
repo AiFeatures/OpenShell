@@ -3,38 +3,62 @@
 
 //! gRPC service implementation.
 
-pub(crate) mod policy;
-mod provider;
+mod auth_rpc;
+pub mod policy;
+pub mod provider;
 mod sandbox;
+mod service;
 mod validation;
+pub mod workspace;
 
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
-    ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, ApproveAllDraftChunksRequest,
+    ApproveAllDraftChunksResponse, ApproveDraftChunkRequest, ApproveDraftChunkResponse,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, ClearDraftChunksRequest,
+    ClearDraftChunksResponse, ComputeDriverCapabilities, ComputeDriverInfo,
+    ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    CreateWorkspaceRequest, CreateWorkspaceResponse, DeleteProviderProfileRequest,
+    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    DeleteServiceRequest, DeleteServiceResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
+    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    GetServiceRequest, GetWorkspaceRequest, GetWorkspaceResponse, HealthRequest, HealthResponse,
+    ImportProviderProfilesRequest, ImportProviderProfilesResponse, IssueSandboxTokenRequest,
+    IssueSandboxTokenResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
+    ListProviderProfilesRequest, ListProviderProfilesResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
+    ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
+    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
+    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
+    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
+    UpdateConfigResponse, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
     UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
+use openshell_server_macros::rpc_authz;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -54,12 +78,39 @@ pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
 }
 
+/// Map a `PersistenceError` to an appropriate gRPC `Status`.
+///
+/// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
+/// to signal that the client should retry with fresh data. Other persistence
+/// errors are mapped to `INTERNAL`.
+pub fn persistence_error_to_status(
+    err: crate::persistence::PersistenceError,
+    operation: &str,
+) -> Status {
+    use crate::persistence::PersistenceError;
+
+    match err {
+        PersistenceError::Conflict {
+            current_resource_version,
+        } => Status::aborted(format!(
+            "{} failed due to concurrent modification (current resource_version: {})",
+            operation,
+            current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+        )),
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field-level size limits (shared across submodules)
 // ---------------------------------------------------------------------------
 
 /// Maximum length for a sandbox or provider name (Kubernetes name limit).
 const MAX_NAME_LEN: usize = 253;
+/// Maximum length for DNS-routable names (workspace, sandbox, service).
+/// Three segments plus two `--` delimiters must fit a 63-char DNS label:
+/// 19 + 2 + 19 + 2 + 19 = 61.
+const MAX_ROUTABLE_NAME_LEN: usize = 19;
 /// Maximum number of providers that can be attached to a sandbox.
 const MAX_PROVIDERS: usize = 32;
 /// Maximum length for the `log_level` field.
@@ -74,6 +125,8 @@ const MAX_MAP_VALUE_LEN: usize = 8192;
 const MAX_TEMPLATE_STRING_LEN: usize = 1024;
 /// Maximum number of entries in template map fields.
 const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
+/// Maximum number of entries in metadata annotations.
+const MAX_METADATA_ANNOTATIONS_ENTRIES: usize = 128;
 /// Maximum serialized size (bytes) for template Struct fields.
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 /// Maximum serialized size (bytes) for the policy field.
@@ -93,6 +146,10 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 struct StoredSettings {
     revision: u64,
     settings: BTreeMap<String, StoredSettingValue>,
+    /// Database `resource_version` for CAS. Not persisted in the JSON payload;
+    /// loaded from `ObjectRecord` and used for optimistic concurrency control.
+    #[serde(skip)]
+    resource_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,9 +166,17 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    Ok(i64::try_from(now.as_millis()).unwrap_or(i64::MAX))
+/// Validate that object metadata is present and contains required fields.
+///
+/// This is a crate-level helper that wraps the validation module's implementation.
+/// Use this from modules outside of `grpc` that need to validate metadata.
+// `tonic::Status` is large but is the API surface of gRPC handlers.
+#[allow(clippy::result_large_err)]
+pub fn validate_object_metadata(
+    metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
+    resource_type: &str,
+) -> Result<(), Status> {
+    validation::validate_object_metadata(metadata, resource_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +202,10 @@ impl OpenShellService {
 // Trait impl — thin delegation to submodules
 // ---------------------------------------------------------------------------
 
+#[rpc_authz(service = "openshell.v1.OpenShell")]
 #[tonic::async_trait]
 impl OpenShell for OpenShellService {
+    #[rpc_auth(auth = "unauthenticated")]
     async fn health(
         &self,
         _request: Request<HealthRequest>,
@@ -149,8 +216,35 @@ impl OpenShell for OpenShellService {
         }))
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:read", role = "admin")]
+    async fn get_gateway_info(
+        &self,
+        _request: Request<GetGatewayInfoRequest>,
+    ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        let compute_drivers = self
+            .state
+            .compute
+            .driver_info_snapshots()
+            .iter()
+            .map(|driver| ComputeDriverInfo {
+                name: driver.name.clone(),
+                capabilities: Some(ComputeDriverCapabilities {
+                    driver_name: driver.driver_name.clone(),
+                    driver_version: driver.driver_version.clone(),
+                }),
+            })
+            .collect();
+
+        Ok(Response::new(GetGatewayInfoResponse {
+            status: ServiceStatus::Healthy.into(),
+            gateway_version: openshell_core::VERSION.to_string(),
+            compute_drivers,
+        }))
+    }
+
     // --- Sandbox lifecycle ---
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
@@ -160,6 +254,10 @@ impl OpenShell for OpenShellService {
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
 
+    // TODO(phase2): data-plane RPCs do not carry a workspace field. Add
+    // workspace verification to confirm the sandbox belongs to the caller's
+    // workspace before proxying.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn watch_sandbox(
         &self,
         request: Request<WatchSandboxRequest>,
@@ -167,6 +265,7 @@ impl OpenShell for OpenShellService {
         sandbox::handle_watch_sandbox(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
@@ -174,6 +273,9 @@ impl OpenShell for OpenShellService {
         sandbox::handle_get_sandbox(&self.state, request).await
     }
 
+    // TODO(phase2): all_workspaces flag is currently accessible to any
+    // authenticated user. Restrict to Platform Admin role in Phase 2.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn list_sandboxes(
         &self,
         request: Request<ListSandboxesRequest>,
@@ -181,6 +283,31 @@ impl OpenShell for OpenShellService {
         sandbox::handle_list_sandboxes(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
+    async fn list_sandbox_providers(
+        &self,
+        request: Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        sandbox::handle_list_sandbox_providers(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn attach_sandbox_provider(
+        &self,
+        request: Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        sandbox::handle_attach_sandbox_provider(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn detach_sandbox_provider(
+        &self,
+        request: Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        sandbox::handle_detach_sandbox_provider(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -192,6 +319,8 @@ impl OpenShell for OpenShellService {
 
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
 
+    // TODO(phase2): no workspace field — see watch_sandbox comment.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
     async fn exec_sandbox(
         &self,
         request: Request<ExecSandboxRequest>,
@@ -199,8 +328,32 @@ impl OpenShell for OpenShellService {
         sandbox::handle_exec_sandbox(&self.state, request).await
     }
 
+    type ForwardTcpStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send + 'static>>;
+
+    // TODO(phase2): no workspace field — see watch_sandbox comment.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn forward_tcp(
+        &self,
+        request: Request<tonic::Streaming<TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        sandbox::handle_forward_tcp(&self.state, request).await
+    }
+
+    type ExecSandboxInteractiveStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn exec_sandbox_interactive(
+        &self,
+        request: Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        sandbox::handle_exec_sandbox_interactive(&self.state, request).await
+    }
+
     // --- SSH sessions ---
 
+    // TODO(phase2): no workspace field — see watch_sandbox comment.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
     async fn create_ssh_session(
         &self,
         request: Request<CreateSshSessionRequest>,
@@ -208,6 +361,41 @@ impl OpenShell for OpenShellService {
         sandbox::handle_create_ssh_session(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn expose_service(
+        &self,
+        request: Request<ExposeServiceRequest>,
+    ) -> Result<Response<ServiceEndpointResponse>, Status> {
+        service::handle_expose_service(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
+    async fn get_service(
+        &self,
+        request: Request<GetServiceRequest>,
+    ) -> Result<Response<ServiceEndpointResponse>, Status> {
+        service::handle_get_service(&self.state, request).await
+    }
+
+    // TODO(phase2): all_workspaces flag is currently accessible to any
+    // authenticated user. Restrict to Platform Admin role in Phase 2.
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
+    async fn list_services(
+        &self,
+        request: Request<ListServicesRequest>,
+    ) -> Result<Response<ListServicesResponse>, Status> {
+        service::handle_list_services(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
+    async fn delete_service(
+        &self,
+        request: Request<DeleteServiceRequest>,
+    ) -> Result<Response<DeleteServiceResponse>, Status> {
+        service::handle_delete_service(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "sandbox:write", role = "user")]
     async fn revoke_ssh_session(
         &self,
         request: Request<RevokeSshSessionRequest>,
@@ -217,6 +405,7 @@ impl OpenShell for OpenShellService {
 
     // --- Providers ---
 
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
     async fn create_provider(
         &self,
         request: Request<CreateProviderRequest>,
@@ -224,6 +413,7 @@ impl OpenShell for OpenShellService {
         provider::handle_create_provider(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
     async fn get_provider(
         &self,
         request: Request<GetProviderRequest>,
@@ -231,6 +421,9 @@ impl OpenShell for OpenShellService {
         provider::handle_get_provider(&self.state, request).await
     }
 
+    // TODO(phase2): all_workspaces flag is currently accessible to any
+    // authenticated user. Restrict to Platform Admin role in Phase 2.
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
     async fn list_providers(
         &self,
         request: Request<ListProvidersRequest>,
@@ -238,6 +431,47 @@ impl OpenShell for OpenShellService {
         provider::handle_list_providers(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
+    async fn list_provider_profiles(
+        &self,
+        request: Request<ListProviderProfilesRequest>,
+    ) -> Result<Response<ListProviderProfilesResponse>, Status> {
+        provider::handle_list_provider_profiles(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
+    async fn get_provider_profile(
+        &self,
+        request: Request<GetProviderProfileRequest>,
+    ) -> Result<Response<ProviderProfileResponse>, Status> {
+        provider::handle_get_provider_profile(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn import_provider_profiles(
+        &self,
+        request: Request<ImportProviderProfilesRequest>,
+    ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+        provider::handle_import_provider_profiles(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn update_provider_profiles(
+        &self,
+        request: Request<UpdateProviderProfilesRequest>,
+    ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+        provider::handle_update_provider_profiles(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
+    async fn lint_provider_profiles(
+        &self,
+        request: Request<LintProviderProfilesRequest>,
+    ) -> Result<Response<LintProviderProfilesResponse>, Status> {
+        provider::handle_lint_provider_profiles(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
     async fn update_provider(
         &self,
         request: Request<UpdateProviderRequest>,
@@ -245,6 +479,39 @@ impl OpenShell for OpenShellService {
         provider::handle_update_provider(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]
+    async fn get_provider_refresh_status(
+        &self,
+        request: Request<GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
+        provider::handle_get_provider_refresh_status(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn configure_provider_refresh(
+        &self,
+        request: Request<ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+        provider::handle_configure_provider_refresh(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn rotate_provider_credential(
+        &self,
+        request: Request<RotateProviderCredentialRequest>,
+    ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        provider::handle_rotate_provider_credential(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn delete_provider_refresh(
+        &self,
+        request: Request<DeleteProviderRefreshRequest>,
+    ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+        provider::handle_delete_provider_refresh(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
@@ -252,8 +519,17 @@ impl OpenShell for OpenShellService {
         provider::handle_delete_provider(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn delete_provider_profile(
+        &self,
+        request: Request<DeleteProviderProfileRequest>,
+    ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+        provider::handle_delete_provider_profile(&self.state, request).await
+    }
+
     // --- Config / Policy ---
 
+    #[rpc_auth(auth = "dual", scope = "config:read", role = "user")]
     async fn get_sandbox_config(
         &self,
         request: Request<GetSandboxConfigRequest>,
@@ -261,6 +537,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_config(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:read", role = "user")]
     async fn get_gateway_config(
         &self,
         request: Request<GetGatewayConfigRequest>,
@@ -268,6 +545,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_gateway_config(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "sandbox")]
     async fn get_sandbox_provider_environment(
         &self,
         request: Request<GetSandboxProviderEnvironmentRequest>,
@@ -275,6 +553,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "dual", scope = "config:write", role = "admin")]
     async fn update_config(
         &self,
         request: Request<UpdateConfigRequest>,
@@ -282,6 +561,7 @@ impl OpenShell for OpenShellService {
         policy::handle_update_config(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn get_sandbox_policy_status(
         &self,
         request: Request<GetSandboxPolicyStatusRequest>,
@@ -289,6 +569,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_policy_status(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn list_sandbox_policies(
         &self,
         request: Request<ListSandboxPoliciesRequest>,
@@ -296,6 +577,7 @@ impl OpenShell for OpenShellService {
         policy::handle_list_sandbox_policies(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "sandbox")]
     async fn report_policy_status(
         &self,
         request: Request<ReportPolicyStatusRequest>,
@@ -305,6 +587,7 @@ impl OpenShell for OpenShellService {
 
     // --- Sandbox logs ---
 
+    #[rpc_auth(auth = "bearer", scope = "sandbox:read", role = "user")]
     async fn get_sandbox_logs(
         &self,
         request: Request<GetSandboxLogsRequest>,
@@ -312,6 +595,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_logs(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "sandbox")]
     async fn push_sandbox_logs(
         &self,
         request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
@@ -321,6 +605,7 @@ impl OpenShell for OpenShellService {
 
     // --- Draft policy recommendations ---
 
+    #[rpc_auth(auth = "sandbox")]
     async fn submit_policy_analysis(
         &self,
         request: Request<SubmitPolicyAnalysisRequest>,
@@ -328,6 +613,7 @@ impl OpenShell for OpenShellService {
         policy::handle_submit_policy_analysis(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "dual", scope = "config:read", role = "user")]
     async fn get_draft_policy(
         &self,
         request: Request<GetDraftPolicyRequest>,
@@ -335,6 +621,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_draft_policy(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn approve_draft_chunk(
         &self,
         request: Request<ApproveDraftChunkRequest>,
@@ -342,6 +629,7 @@ impl OpenShell for OpenShellService {
         policy::handle_approve_draft_chunk(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn reject_draft_chunk(
         &self,
         request: Request<RejectDraftChunkRequest>,
@@ -349,6 +637,7 @@ impl OpenShell for OpenShellService {
         policy::handle_reject_draft_chunk(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn approve_all_draft_chunks(
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
@@ -356,6 +645,7 @@ impl OpenShell for OpenShellService {
         policy::handle_approve_all_draft_chunks(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn edit_draft_chunk(
         &self,
         request: Request<EditDraftChunkRequest>,
@@ -363,6 +653,7 @@ impl OpenShell for OpenShellService {
         policy::handle_edit_draft_chunk(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn undo_draft_chunk(
         &self,
         request: Request<UndoDraftChunkRequest>,
@@ -370,6 +661,7 @@ impl OpenShell for OpenShellService {
         policy::handle_undo_draft_chunk(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
     async fn clear_draft_chunks(
         &self,
         request: Request<ClearDraftChunksRequest>,
@@ -377,11 +669,153 @@ impl OpenShell for OpenShellService {
         policy::handle_clear_draft_chunks(&self.state, request).await
     }
 
+    #[rpc_auth(auth = "bearer", scope = "config:read", role = "user")]
     async fn get_draft_history(
         &self,
         request: Request<GetDraftHistoryRequest>,
     ) -> Result<Response<GetDraftHistoryResponse>, Status> {
         policy::handle_get_draft_history(&self.state, request).await
+    }
+
+    // --- Sandbox identity ---
+
+    #[rpc_auth(auth = "sandbox")]
+    async fn issue_sandbox_token(
+        &self,
+        request: Request<IssueSandboxTokenRequest>,
+    ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        auth_rpc::handle_issue_sandbox_token(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "sandbox")]
+    async fn refresh_sandbox_token(
+        &self,
+        request: Request<RefreshSandboxTokenRequest>,
+    ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+        auth_rpc::handle_refresh_sandbox_token(&self.state, request).await
+    }
+
+    // --- Supervisor session ---
+
+    type ConnectSupervisorStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>>;
+
+    #[rpc_auth(auth = "sandbox")]
+    async fn connect_supervisor(
+        &self,
+        request: Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        crate::supervisor_session::handle_connect_supervisor(&self.state, request).await
+    }
+
+    type RelayStreamStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>;
+
+    #[rpc_auth(auth = "sandbox")]
+    async fn relay_stream(
+        &self,
+        request: Request<tonic::Streaming<RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
+            .await
+    }
+
+    // --- Workspace management ---
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:write", role = "admin")]
+    async fn create_workspace(
+        &self,
+        request: Request<CreateWorkspaceRequest>,
+    ) -> Result<Response<CreateWorkspaceResponse>, Status> {
+        workspace::handle_create_workspace(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:read", role = "user")]
+    async fn get_workspace(
+        &self,
+        request: Request<GetWorkspaceRequest>,
+    ) -> Result<Response<GetWorkspaceResponse>, Status> {
+        workspace::handle_get_workspace(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:read", role = "user")]
+    async fn list_workspaces(
+        &self,
+        request: Request<ListWorkspacesRequest>,
+    ) -> Result<Response<ListWorkspacesResponse>, Status> {
+        workspace::handle_list_workspaces(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:write", role = "admin")]
+    async fn delete_workspace(
+        &self,
+        request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        workspace::handle_delete_workspace(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:write", role = "admin")]
+    async fn add_workspace_member(
+        &self,
+        request: Request<AddWorkspaceMemberRequest>,
+    ) -> Result<Response<AddWorkspaceMemberResponse>, Status> {
+        workspace::handle_add_workspace_member(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:write", role = "admin")]
+    async fn remove_workspace_member(
+        &self,
+        request: Request<RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<RemoveWorkspaceMemberResponse>, Status> {
+        workspace::handle_remove_workspace_member(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "workspace:read", role = "user")]
+    async fn list_workspace_members(
+        &self,
+        request: Request<ListWorkspaceMembersRequest>,
+    ) -> Result<Response<ListWorkspaceMembersResponse>, Status> {
+        workspace::handle_list_workspace_members(&self.state, request).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared test support
+// ---------------------------------------------------------------------------
+
+/// Shared test helpers for grpc submodule unit tests.
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+
+    /// Build an in-memory `ServerState` for unit tests.
+    pub async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
     }
 }
 

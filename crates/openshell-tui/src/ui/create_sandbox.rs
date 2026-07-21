@@ -8,6 +8,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, CreateFormField, CreatePhase};
 
+use super::centered_rect;
+
 /// Draw the create sandbox modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(form) = &app.create_form else {
@@ -73,7 +75,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(inner);
 
     // --- Name ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Name",
         &form.name,
@@ -81,10 +83,12 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Name,
         chunks[0],
         t,
+        "█",
+        true,
     );
 
     // --- Image ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Image",
         &form.image,
@@ -92,10 +96,12 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Image,
         chunks[1],
         t,
+        "█",
+        true,
     );
 
     // --- Command ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Command",
         &form.command,
@@ -103,6 +109,8 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Command,
         chunks[2],
         t,
+        "█",
+        true,
     );
 
     // --- Providers label ---
@@ -274,7 +282,7 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Header — changes once result arrives.
     let (header, header_style) = match &form.create_result {
-        Some(Ok(name)) => (format!("Created sandbox: {name}"), t.status_ok),
+        Some(Ok((name, _workspace))) => (format!("Created sandbox: {name}"), t.status_ok),
         Some(Err(msg)) => (format!("Failed: {msg}"), t.status_err),
         None => ("Creating sandbox...".to_string(), t.text),
     };
@@ -304,7 +312,7 @@ pub fn render_chase(
     }
 
     let frame = (elapsed_ms / 140) as usize;
-    let mouth_open = frame % 2 == 0;
+    let mouth_open = frame.is_multiple_of(2);
 
     // Characters.
     let pac = if mouth_open { "ᗧ" } else { "●" };
@@ -360,83 +368,18 @@ pub fn render_chase(
     let mut current_style = buf[0].1;
 
     for &(ch, style) in &buf {
-        if style == current_style {
-            current_str.push(ch);
-        } else {
+        if style != current_style {
             if !current_str.is_empty() {
                 spans.push(Span::styled(current_str.clone(), current_style));
                 current_str.clear();
             }
             current_style = style;
-            current_str.push(ch);
         }
+        current_str.push(ch);
     }
     if !current_str.is_empty() {
         spans.push(Span::styled(current_str, current_style));
     }
 
     Line::from(spans)
-}
-
-// ---------------------------------------------------------------------------
-// Form helpers
-// ---------------------------------------------------------------------------
-
-fn draw_text_field(
-    frame: &mut Frame<'_>,
-    label: &str,
-    value: &str,
-    placeholder: &str,
-    focused: bool,
-    area: Rect,
-    theme: &crate::theme::Theme,
-) {
-    let t = theme;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // input
-            Constraint::Length(1), // gap
-        ])
-        .split(area);
-
-    let label_style = if focused { t.accent_bold } else { t.text };
-    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
-    if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
-    }
-    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
-
-    let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", t.muted))
-    } else if focused {
-        Line::from(vec![
-            Span::styled(format!("  {value}"), t.accent),
-            Span::styled("█", t.accent),
-        ])
-    } else {
-        Line::from(Span::styled(format!("  {value}"), t.text))
-    };
-    frame.render_widget(Paragraph::new(display), chunks[1]);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }
