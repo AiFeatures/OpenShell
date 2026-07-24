@@ -3,20 +3,34 @@
 
 //! CLI command implementations.
 
+pub use crate::commands::common::{
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
+    parse_secret_material_env_pairs,
+};
+use crate::commands::common::{
+    ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
+    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
+    format_setting_value, format_timestamp, format_timestamp_ms, handle_platform_progress_event,
+    is_provisioning_progress_event, non_empty_or, parse_cli_setting_value,
+    parse_credential_expiry_pairs, parse_credential_pairs, parse_duration_to_ms, phase_name,
+    print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
+    provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
+    truncate_display, truncate_status_field,
+};
+
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
     grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
-use chrono::DateTime;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
@@ -26,11 +40,6 @@ use openshell_bootstrap::{
 };
 use openshell_bootstrap::{
     GatewayMetadataSource, ListedGateway, gateway_metadata_source, list_gateways_with_source,
-};
-use openshell_core::progress::{
-    PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
-    PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
-    PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
@@ -42,21 +51,20 @@ use openshell_core::proto::{
     ExposeServiceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetGatewayInfoRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
     GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
-    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, HealthRequest,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxesRequest, ListServicesRequest, PolicySource, PolicyStatus, Provider,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
     SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    ServiceStatus, SetInferenceRouteRequest, SettingScope, SettingValue, TcpForwardFrame,
-    TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
-    tcp_forward_init,
+    ServiceStatus, SetInferenceRouteRequest, SettingScope, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
-use openshell_core::settings::{self, SettingValueKind};
+use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use openshell_providers::{
     ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
@@ -82,27 +90,6 @@ pub use openshell_core::forward::{
     ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PolicyGetView {
-    Metadata,
-    Base,
-    Full,
-}
-
-impl PolicyGetView {
-    pub fn from_flags(base: bool, full: bool) -> Self {
-        match (base, full) {
-            (true, _) => Self::Base,
-            (false, true) => Self::Full,
-            (false, false) => Self::Metadata,
-        }
-    }
-
-    fn includes_policy(self) -> bool {
-        matches!(self, Self::Base | Self::Full)
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum SandboxUploadPlan {
     GitAware {
@@ -111,419 +98,6 @@ enum SandboxUploadPlan {
     },
     Regular,
     GitFilteredEmpty,
-}
-
-/// Convert a sandbox phase integer to a human-readable string.
-fn phase_name(phase: i32) -> &'static str {
-    match SandboxPhase::try_from(phase) {
-        Ok(SandboxPhase::Unspecified) => "Unspecified",
-        Ok(SandboxPhase::Provisioning) => "Provisioning",
-        Ok(SandboxPhase::Ready) => "Ready",
-        Ok(SandboxPhase::Error) => "Error",
-        Ok(SandboxPhase::Deleting) => "Deleting",
-        Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
-    }
-}
-
-fn ready_false_condition_message(
-    status: Option<&openshell_core::proto::SandboxStatus>,
-) -> Option<String> {
-    let condition = status?.conditions.iter().find(|condition| {
-        condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
-    })?;
-
-    if condition.message.is_empty() {
-        if condition.reason.is_empty() {
-            None
-        } else {
-            Some(condition.reason.clone())
-        }
-    } else if condition.reason.is_empty() {
-        Some(condition.message.clone())
-    } else {
-        Some(format!("{}: {}", condition.reason, condition.message))
-    }
-}
-
-fn provisioning_timeout_message(
-    timeout_secs: u64,
-    resource_requirements: Option<&ResourceRequirements>,
-    condition_message: Option<&str>,
-) -> String {
-    let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
-
-    if let Some(condition_message) = condition_message.filter(|msg| !msg.is_empty()) {
-        message.push_str(". Last reported status: ");
-        message.push_str(condition_message);
-    }
-
-    if resource_requirements.is_some_and(|requirements| requirements.gpu.is_some()) {
-        message.push_str(
-            ". Hint: this may be because the available GPU is already in use by another sandbox.",
-        );
-    }
-
-    message
-}
-
-/// Format milliseconds since Unix epoch as a `YYYY-MM-DD HH:MM:SS` UTC string.
-fn format_epoch_ms(ms: i64) -> String {
-    use std::time::UNIX_EPOCH;
-
-    let Ok(ms_u64) = u64::try_from(ms) else {
-        return "-".to_string();
-    };
-    let Ok(time) = UNIX_EPOCH
-        .checked_add(Duration::from_millis(ms_u64))
-        .ok_or(())
-    else {
-        return "-".to_string();
-    };
-    let Ok(dur) = time.duration_since(UNIX_EPOCH) else {
-        return "-".to_string();
-    };
-
-    let secs = dur.as_secs();
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Convert days since epoch to year-month-day using a basic civil calendar algorithm.
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {hours:02}:{minutes:02}:{seconds:02}")
-}
-
-/// Convert days since 1970-01-01 to (year, month, day).
-/// Algorithm from Howard Hinnant's `chrono`-compatible date library.
-fn civil_from_days(days: u64) -> (i64, u64, u64) {
-    let z = days.cast_signed() + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097).cast_unsigned();
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe.cast_signed() + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-/// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProvisioningStep {
-    /// Sandbox CRD created, waiting for pod to be scheduled.
-    RequestingSandbox,
-    /// Pulling the sandbox container image.
-    PullingSandboxImage,
-    /// Container is starting up.
-    StartingSandbox,
-}
-
-impl ProvisioningStep {
-    /// Human-readable label for a completed step.
-    fn completed_label(self) -> &'static str {
-        match self {
-            Self::RequestingSandbox => "Sandbox allocated",
-            Self::PullingSandboxImage => "Image pulled",
-            Self::StartingSandbox => "Sandbox ready",
-        }
-    }
-
-    /// Human-readable label for an in-progress step (shown on the spinner).
-    fn active_label(self) -> &'static str {
-        match self {
-            Self::RequestingSandbox => "Requesting sandbox...",
-            Self::PullingSandboxImage => "Pulling image...",
-            Self::StartingSandbox => "Starting sandbox...",
-        }
-    }
-}
-
-/// Live-updating display showing a provisioning step checklist with spinner.
-///
-/// Completed steps are printed as static `✓ Step` lines.  The current
-/// in-progress step is shown on a spinner with elapsed time.
-struct ProvisioningDisplay {
-    mp: MultiProgress,
-    spinner: ProgressBar,
-    /// Blank line below the spinner so progress doesn't sit flush against
-    /// the bottom of the terminal.
-    spacer: ProgressBar,
-    /// Steps that have been completed, in order.
-    completed_steps: Vec<ProvisioningStep>,
-    /// Progress bars for completed steps (so they can be cleared).
-    completed_bars: Vec<ProgressBar>,
-    /// The currently active step label (shown on the spinner).
-    active_label: String,
-    /// Detail text shown next to the active step (e.g. image name).
-    active_detail: String,
-    /// When the current active step started (for elapsed time).
-    step_start: Instant,
-}
-
-impl ProvisioningDisplay {
-    fn new() -> Self {
-        let mp = MultiProgress::new();
-
-        let spinner = mp.add(ProgressBar::new_spinner());
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        spinner.enable_steady_tick(Duration::from_millis(120));
-
-        // Always keep a blank line below the spinner so the progress area
-        // doesn't sit flush against the bottom of the terminal.
-        let spacer = mp.add(ProgressBar::new(0));
-        spacer.set_style(
-            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
-        );
-        spacer.set_message("");
-
-        let now = Instant::now();
-        Self {
-            mp,
-            spinner,
-            spacer,
-            completed_steps: Vec::new(),
-            completed_bars: Vec::new(),
-            active_label: ProvisioningStep::RequestingSandbox
-                .active_label()
-                .to_string(),
-            active_detail: String::new(),
-            step_start: now,
-        }
-    }
-
-    /// Record a completed provisioning step with a custom label.
-    fn complete_step_with_label(&mut self, step: ProvisioningStep, label: &str) {
-        // Don't duplicate steps we've already printed.
-        if self.completed_steps.contains(&step) {
-            return;
-        }
-        self.completed_steps.push(step);
-
-        let elapsed = self.step_start.elapsed();
-        let elapsed_str = format_elapsed(elapsed);
-
-        // Use a progress bar instead of println so we can clear it later.
-        let bar = self.mp.insert_before(&self.spinner, ProgressBar::new(0));
-        bar.set_style(
-            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
-        );
-        bar.set_message(format!(
-            "{} {} {}",
-            "\u{2713}".green().bold(),
-            label,
-            elapsed_str.dimmed()
-        ));
-        bar.finish();
-        self.completed_bars.push(bar);
-
-        // Reset step timer for the next step.
-        self.step_start = Instant::now();
-        self.spinner.reset_elapsed();
-        self.active_detail.clear();
-    }
-
-    /// Set the active (in-progress) step shown on the spinner.
-    fn set_active(&mut self, label: &str) {
-        self.active_label = label.to_string();
-        self.active_detail.clear();
-        // Reset the spinner's elapsed time for the new step.
-        self.spinner.reset_elapsed();
-        self.step_start = Instant::now();
-        self.update_spinner();
-    }
-
-    /// Set the active step from a known provisioning step enum.
-    fn set_active_step(&mut self, step: ProvisioningStep) {
-        self.set_active(step.active_label());
-    }
-
-    /// Set detail text shown alongside the active step (e.g. image name).
-    fn set_active_detail(&mut self, detail: &str) {
-        self.active_detail = detail.to_string();
-        self.update_spinner();
-    }
-
-    fn update_spinner(&self) {
-        let msg = if self.active_detail.is_empty() {
-            self.active_label.clone()
-        } else {
-            format!("{} {}", self.active_label, self.active_detail.dimmed())
-        };
-        self.spinner.set_message(msg);
-    }
-
-    /// Finish with an error message shown on the last step line.
-    fn finish_error(&self, msg: &str) {
-        let _ = self
-            .mp
-            .println(format!("{} {}", "\u{2717}".red().bold(), msg.red()));
-        self.spinner.finish_and_clear();
-    }
-
-    /// Print a line above the progress bars (for static header content).
-    fn println(&self, msg: &str) {
-        let _ = self.mp.println(msg);
-    }
-
-    /// Clear all progress output (spinner, spacer, and completed step lines).
-    fn clear(&self) {
-        self.spacer.finish_and_clear();
-        self.spinner.finish_and_clear();
-        for bar in &self.completed_bars {
-            bar.finish_and_clear();
-        }
-    }
-}
-
-/// Format a duration as a compact elapsed time string, e.g. `(3s)` or `(1m 12s)`.
-fn format_elapsed(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("({secs}s)")
-    } else {
-        let mins = secs / 60;
-        let rem = secs % 60;
-        format!("({mins}m {rem}s)")
-    }
-}
-
-/// Format a total elapsed time for non-interactive mode timestamps.
-fn format_timestamp(d: Duration) -> String {
-    let secs = d.as_secs_f64();
-    format!("[{secs:.1}s]")
-}
-
-fn progress_step_from_metadata(value: &str) -> Option<ProvisioningStep> {
-    match value {
-        PROGRESS_STEP_REQUESTING_SANDBOX => Some(ProvisioningStep::RequestingSandbox),
-        PROGRESS_STEP_PULLING_IMAGE => Some(ProvisioningStep::PullingSandboxImage),
-        PROGRESS_STEP_STARTING_SANDBOX => Some(ProvisioningStep::StartingSandbox),
-        _ => None,
-    }
-}
-
-fn noninteractive_active_label(step: ProvisioningStep) -> String {
-    step.active_label().trim_end_matches('.').to_string()
-}
-
-fn handle_platform_progress_event(
-    event: &PlatformEvent,
-    display: &mut Option<ProvisioningDisplay>,
-    provision_start: Instant,
-) -> bool {
-    let completed_step = event
-        .metadata
-        .get(PROGRESS_COMPLETE_STEP_KEY)
-        .and_then(|step| progress_step_from_metadata(step));
-    let active_step = event
-        .metadata
-        .get(PROGRESS_ACTIVE_STEP_KEY)
-        .and_then(|step| progress_step_from_metadata(step));
-    let active_detail = event
-        .metadata
-        .get(PROGRESS_ACTIVE_DETAIL_KEY)
-        .filter(|detail| !detail.is_empty());
-
-    let handled = completed_step.is_some() || active_step.is_some() || active_detail.is_some();
-    if !handled {
-        return false;
-    }
-
-    if let Some(step) = completed_step {
-        let label = event
-            .metadata
-            .get(PROGRESS_COMPLETE_LABEL_KEY)
-            .map_or_else(|| step.completed_label(), String::as_str);
-        if let Some(d) = display.as_mut() {
-            d.complete_step_with_label(step, label);
-        } else {
-            let ts = format_timestamp(provision_start.elapsed());
-            println!("{} {}", ts.dimmed(), label);
-        }
-    }
-
-    if let Some(step) = active_step
-        && let Some(d) = display.as_mut()
-    {
-        d.set_active_step(step);
-    }
-
-    if let Some(detail) = active_detail {
-        if let Some(d) = display.as_mut() {
-            d.set_active_detail(detail);
-        } else {
-            let ts = format_timestamp(provision_start.elapsed());
-            if let Some(step) = active_step {
-                println!(
-                    "{} {} {}",
-                    ts.dimmed(),
-                    noninteractive_active_label(step),
-                    detail
-                );
-            } else {
-                println!("{} {}", ts.dimmed(), detail);
-            }
-        }
-    }
-
-    true
-}
-
-fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
-    if event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
-        || event.metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY)
-        || event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY)
-    {
-        return true;
-    }
-
-    event.source == "vm"
-        && matches!(
-            event.reason.as_str(),
-            "PullingLayer"
-                | "ResolvingImage"
-                | "AuthenticatingRegistry"
-                | "FetchingManifest"
-                | "CacheHit"
-                | "CacheMiss"
-                | "WaitingForImageCacheLock"
-                | "ExportingRootfs"
-                | "PreparingRootfs"
-                | "CreatingRootDisk"
-                | "PreparingOverlay"
-                | "Started"
-        )
-}
-
-fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
-    let lines = [
-        String::new(),
-        format!(
-            "{} {}",
-            "Created sandbox:".cyan().bold(),
-            sandbox.object_name().bold()
-        ),
-        String::new(),
-    ];
-    match display {
-        Some(d) => {
-            for line in lines {
-                d.println(&line);
-            }
-        }
-        None => {
-            for line in lines {
-                println!("{line}");
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -548,61 +122,330 @@ struct ComputeDriverCapabilitiesView {
     driver_version: String,
 }
 
+enum ProgressOutput {
+    Interactive(ProvisioningDisplay),
+    Plain,
+    Silent,
+}
+
+impl ProgressOutput {
+    fn as_interactive_mut(&mut self) -> Option<&mut ProvisioningDisplay> {
+        match self {
+            Self::Interactive(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn as_interactive(&self) -> Option<&ProvisioningDisplay> {
+        match self {
+            Self::Interactive(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn is_plain(&self) -> bool {
+        matches!(self, Self::Plain)
+    }
+}
+
 /// Show gateway status.
 #[allow(clippy::branches_sharing_code)]
-pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_status(
+    gateway_name: &str,
+    server: &str,
+    output: &str,
+    tls: &TlsOptions,
+    auth_preparation_error: Option<&str>,
+) -> Result<()> {
+    // Build status data before any output.
+    let is_bearer = tls.is_bearer_auth();
+    let (status_str, version, error, http_status, authentication): (
+        &str,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        GatewayAuthenticationState,
+    ) = match grpc_client(server, tls).await {
+        Ok(mut client) => match client.health(HealthRequest {}).await {
+            Ok(response) => {
+                let health = response.into_inner();
+                let auth = match auth_preparation_error {
+                    Some(e) => GatewayAuthenticationState::Failed(e.to_string()),
+                    None => gateway_authentication_state(
+                        client
+                            .get_gateway_info(GetGatewayInfoRequest {})
+                            .await
+                            .map(|_| ()),
+                        tls,
+                        server,
+                    ),
+                };
+                ("connected", Some(health.version), None, None, auth)
+            }
+            Err(e) => {
+                let auth = auth_preparation_error.map_or_else(
+                    || {
+                        GatewayAuthenticationState::Unverified(
+                            "gRPC health check failed".to_string(),
+                        )
+                    },
+                    |err| GatewayAuthenticationState::Failed(err.to_string()),
+                );
+                http_health_check(server, tls).await?.map_or_else(
+                    || ("error", None, Some(e.to_string()), None, auth.clone()),
+                    |http| {
+                        let hs = Some(http.to_string());
+                        if http.is_success() {
+                            (
+                                "connected_http",
+                                None,
+                                Some(e.to_string()),
+                                hs,
+                                auth.clone(),
+                            )
+                        } else {
+                            ("error", None, Some(e.to_string()), hs, auth.clone())
+                        }
+                    },
+                )
+            }
+        },
+        Err(e) => {
+            let auth = auth_preparation_error.map_or_else(
+                || GatewayAuthenticationState::Unverified("gateway unreachable".to_string()),
+                |err| GatewayAuthenticationState::Failed(err.to_string()),
+            );
+            http_health_check(server, tls).await?.map_or_else(
+                || {
+                    (
+                        "disconnected",
+                        None,
+                        Some(e.to_string()),
+                        None,
+                        auth.clone(),
+                    )
+                },
+                |http| {
+                    let hs = Some(http.to_string());
+                    if http.is_success() {
+                        (
+                            "connected_http",
+                            None,
+                            Some(e.to_string()),
+                            hs,
+                            auth.clone(),
+                        )
+                    } else {
+                        ("disconnected", None, Some(e.to_string()), hs, auth.clone())
+                    }
+                },
+            )
+        }
+    };
+
+    let json_data = status_to_json(
+        gateway_name,
+        server,
+        is_bearer,
+        status_str,
+        &version,
+        &error,
+        &http_status,
+        &authentication,
+    );
+    if crate::output::print_output_single(output, &json_data, Clone::clone)? {
+        return Ok(());
+    }
+
+    // Human-readable output.
     println!("{}", "Server Status".cyan().bold());
     println!();
     println!("  {} {}", "Gateway:".dimmed(), gateway_name);
     println!("  {} {}", "Server:".dimmed(), server);
-    if tls.is_bearer_auth() {
-        println!("  {} Edge (bearer token)", "Auth:".dimmed());
-    }
 
-    // Try to connect and get health
-    match grpc_client(server, tls).await {
-        Ok(mut client) => match client.health(HealthRequest {}).await {
-            Ok(response) => {
-                let health = response.into_inner();
-                println!("  {} {}", "Status:".dimmed(), "Connected".green());
-                println!("  {} {}", "Version:".dimmed(), health.version);
+    match status_str {
+        "connected" => {
+            println!("  {} {}", "Status:".dimmed(), "Connected".green());
+            print_gateway_authentication_state(&authentication);
+            if let Some(ref v) = version {
+                println!("  {} {}", "Version:".dimmed(), v);
             }
-            Err(e) => {
-                if let Some(status) = http_health_check(server, tls).await? {
-                    if status.is_success() {
-                        println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
-                        println!("  {} {}", "HTTP: ".dimmed(), status);
-                        println!("  {} {}", "gRPC error:".dimmed(), e);
-                    } else {
-                        println!("  {} {}", "Status:".dimmed(), "Error".red());
-                        println!("  {} {}", "HTTP:".dimmed(), status);
-                        println!("  {} {}", "gRPC error:".dimmed(), e);
-                    }
-                } else {
-                    println!("  {} {}", "Status:".dimmed(), "Error".red());
-                    println!("  {} {}", "Error:".dimmed(), e);
-                }
+        }
+        "connected_http" => {
+            println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP: ".dimmed(), hs);
             }
-        },
-        Err(e) => {
-            if let Some(status) = http_health_check(server, tls).await? {
-                if status.is_success() {
-                    println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
-                    println!("  {} {}", "HTTP:".dimmed(), status);
+            if let Some(ref e) = error {
+                println!("  {} {}", "gRPC error:".dimmed(), e);
+            }
+            print_gateway_authentication_state(&authentication);
+        }
+        "error" => {
+            println!("  {} {}", "Status:".dimmed(), "Error".red());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP:".dimmed(), hs);
+                if let Some(ref e) = error {
                     println!("  {} {}", "gRPC error:".dimmed(), e);
-                } else {
-                    println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
-                    println!("  {} {}", "HTTP:".dimmed(), status);
-                    println!("  {} {}", "Error:".dimmed(), e);
                 }
-            } else {
-                println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
+            } else if let Some(ref e) = error {
                 println!("  {} {}", "Error:".dimmed(), e);
             }
+            print_gateway_authentication_state(&authentication);
+        }
+        _ => {
+            println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP:".dimmed(), hs);
+            }
+            if let Some(ref e) = error {
+                println!("  {} {}", "Error:".dimmed(), e);
+            }
+            print_gateway_authentication_state(&authentication);
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayAuthenticationState {
+    Authenticated(&'static str),
+    NotRequired(&'static str),
+    Failed(String),
+    Unverified(String),
+}
+
+fn gateway_authentication_state(
+    result: std::result::Result<(), Status>,
+    tls: &TlsOptions,
+    server: &str,
+) -> GatewayAuthenticationState {
+    match result {
+        Ok(()) if tls.oidc_token.is_some() => GatewayAuthenticationState::Authenticated("OIDC"),
+        Ok(()) if tls.edge_token.is_some() => GatewayAuthenticationState::Authenticated("edge"),
+        Ok(()) if server.starts_with("https://") => {
+            GatewayAuthenticationState::Authenticated("mTLS transport")
+        }
+        Ok(()) => GatewayAuthenticationState::NotRequired("gateway"),
+        Err(status) if status.code() == Code::Unauthenticated => {
+            GatewayAuthenticationState::Failed(status.message().to_string())
+        }
+        Err(status) if status.code() == Code::PermissionDenied => {
+            let provider = if tls.oidc_token.is_some() {
+                "OIDC; authorization denied"
+            } else if tls.edge_token.is_some() {
+                "edge; authorization denied"
+            } else if server.starts_with("https://") {
+                "mTLS transport; authorization denied"
+            } else {
+                "authorization denied"
+            };
+            GatewayAuthenticationState::Authenticated(provider)
+        }
+        Err(status) if status.code() == Code::Unimplemented && tls.edge_token.is_some() => {
+            GatewayAuthenticationState::Authenticated("edge")
+        }
+        Err(status)
+            if status.code() == Code::Unimplemented
+                && !tls.is_bearer_auth()
+                && server.starts_with("http://") =>
+        {
+            GatewayAuthenticationState::NotRequired("gateway")
+        }
+        Err(status)
+            if status.code() == Code::Unimplemented
+                && !tls.is_bearer_auth()
+                && server.starts_with("https://") =>
+        {
+            GatewayAuthenticationState::Authenticated("mTLS transport")
+        }
+        Err(status) if status.code() == Code::Unimplemented => {
+            GatewayAuthenticationState::Unverified(
+                "gateway does not support authentication checks".to_string(),
+            )
+        }
+        Err(status) => GatewayAuthenticationState::Unverified(status.message().to_string()),
+    }
+}
+
+fn print_gateway_authentication_state(state: &GatewayAuthenticationState) {
+    match state {
+        GatewayAuthenticationState::Authenticated(provider) => println!(
+            "  {} {} ({provider})",
+            "Authentication:".dimmed(),
+            "Authenticated".green()
+        ),
+        GatewayAuthenticationState::NotRequired(mode) => println!(
+            "  {} {} ({mode})",
+            "Authentication:".dimmed(),
+            "Not required".green()
+        ),
+        GatewayAuthenticationState::Failed(error) => println!(
+            "  {} {} ({error})",
+            "Authentication:".dimmed(),
+            "Failed".red()
+        ),
+        GatewayAuthenticationState::Unverified(reason) => println!(
+            "  {} {} ({reason})",
+            "Authentication:".dimmed(),
+            "Unverified".yellow()
+        ),
+    }
+}
+
+fn authentication_state_to_json(state: &GatewayAuthenticationState) -> serde_json::Value {
+    match state {
+        GatewayAuthenticationState::Authenticated(provider) => serde_json::json!({
+            "status": "authenticated",
+            "provider": provider,
+        }),
+        GatewayAuthenticationState::NotRequired(mode) => serde_json::json!({
+            "status": "not_required",
+            "mode": mode,
+        }),
+        GatewayAuthenticationState::Failed(error) => serde_json::json!({
+            "status": "failed",
+            "error": error,
+        }),
+        GatewayAuthenticationState::Unverified(reason) => serde_json::json!({
+            "status": "unverified",
+            "reason": reason,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn status_to_json(
+    gateway_name: &str,
+    server: &str,
+    is_bearer: bool,
+    status: &str,
+    version: &Option<String>,
+    error: &Option<String>,
+    http_status: &Option<String>,
+    authentication: &GatewayAuthenticationState,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "gateway": gateway_name,
+        "server": server,
+        "status": status,
+        "authentication": authentication_state_to_json(authentication),
+    });
+    let map = obj.as_object_mut().expect("json! returns object");
+    if is_bearer {
+        map.insert("auth".into(), serde_json::json!("edge_bearer"));
+    }
+    if let Some(v) = version {
+        map.insert("version".into(), serde_json::json!(v));
+    }
+    if let Some(hs) = http_status {
+        map.insert("http_status".into(), serde_json::json!(hs));
+    }
+    if let Some(e) = error {
+        map.insert("error".into(), serde_json::json!(e));
+    }
+    obj
 }
 
 fn gateway_service_status_name(status: i32) -> &'static str {
@@ -1930,6 +1773,7 @@ pub struct SandboxCreateConfig<'a> {
     pub labels: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
+    pub output: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -1953,6 +1797,7 @@ impl Default for SandboxCreateConfig<'_> {
             labels: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
+            output: "table",
         }
     }
 }
@@ -1984,6 +1829,7 @@ pub async fn sandbox_create(
         labels,
         environment,
         approval_mode,
+        output,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -2133,23 +1979,36 @@ pub async fn sandbox_create(
         }
     }
 
+    let structured_output = output != "table";
+
     // Set up display — interactive terminals get a step-based checklist with
-    // spinners; non-interactive (pipes / CI) get timestamped lines.
-    let mut display = if interactive {
-        Some(ProvisioningDisplay::new())
+    // spinners; non-interactive (pipes / CI) get timestamped lines;
+    // structured output suppresses all stdout progress.
+    let mut display = if structured_output {
+        ProgressOutput::Silent
+    } else if interactive {
+        ProgressOutput::Interactive(ProvisioningDisplay::new())
     } else {
-        None
+        ProgressOutput::Plain
     };
 
-    // Print header
-    print_sandbox_header(&sandbox, display.as_ref());
-
-    // Set initial active step on the spinner.
-    if let Some(d) = display.as_mut() {
-        d.set_active_step(ProvisioningStep::RequestingSandbox);
+    if structured_output {
+        eprintln!("Provisioning sandbox (structured output on stdout)...");
     } else {
-        let ts = format_timestamp(Duration::ZERO);
-        println!("  {} Requesting compute...", ts.dimmed());
+        // Print header
+        print_sandbox_header(&sandbox, display.as_interactive());
+
+        // Set initial active step on the spinner.
+        match &mut display {
+            ProgressOutput::Interactive(d) => {
+                d.set_active_step(ProvisioningStep::RequestingSandbox);
+            }
+            ProgressOutput::Plain => {
+                let ts = format_timestamp(Duration::ZERO);
+                println!("  {} Requesting compute...", ts.dimmed());
+            }
+            ProgressOutput::Silent => {}
+        }
     }
 
     // Non-interactive mode: track start time for timestamps.
@@ -2183,6 +2042,7 @@ pub async fn sandbox_create(
         .into_inner();
 
     let mut last_phase = sandbox.phase();
+    let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
@@ -2209,10 +2069,12 @@ pub async fn sandbox_create(
                 resource_requirements.as_ref(),
                 last_condition_message.as_deref(),
             );
-            if let Some(d) = display.as_mut() {
+            if let Some(d) = display.as_interactive_mut() {
                 d.finish_error(&timeout_message);
             }
-            println!();
+            if display.is_plain() {
+                println!();
+            }
             return Err(miette::miette!(timeout_message));
         }
 
@@ -2228,10 +2090,12 @@ pub async fn sandbox_create(
                     resource_requirements.as_ref(),
                     last_condition_message.as_deref(),
                 );
-                if let Some(d) = display.as_mut() {
+                if let Some(d) = display.as_interactive_mut() {
                     d.finish_error(&timeout_message);
                 }
-                println!();
+                if display.is_plain() {
+                    println!();
+                }
                 return Err(miette::miette!(timeout_message));
             }
         };
@@ -2241,6 +2105,7 @@ pub async fn sandbox_create(
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
+                last_sandbox = s.clone();
                 if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
@@ -2268,7 +2133,7 @@ pub async fn sandbox_create(
                 // Only accept Ready as terminal after we've observed a
                 // non-Ready phase, proving the controller has reconciled.
                 if saw_non_ready && phase == SandboxPhase::Ready {
-                    if let Some(d) = display.as_mut() {
+                    if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
                     break;
@@ -2282,7 +2147,24 @@ pub async fn sandbox_create(
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
                 let extends_timeout = is_provisioning_progress_event(&ev);
-                if handle_platform_progress_event(&ev, &mut display, provision_start) {
+                // Silent mode suppresses all progress output; only update
+                // the deadline when applicable.
+                let handled = match &mut display {
+                    ProgressOutput::Interactive(d) => {
+                        let mut opt = Some(std::mem::replace(d, ProvisioningDisplay::new()));
+                        let h = handle_platform_progress_event(&ev, &mut opt, provision_start);
+                        if let Some(inner) = opt {
+                            *d = inner;
+                        }
+                        h
+                    }
+                    ProgressOutput::Plain => {
+                        let mut opt: Option<ProvisioningDisplay> = None;
+                        handle_platform_progress_event(&ev, &mut opt, provision_start)
+                    }
+                    ProgressOutput::Silent => false,
+                };
+                if handled {
                     if extends_timeout {
                         provisioning_idle_deadline = Instant::now() + provision_timeout;
                     }
@@ -2292,19 +2174,21 @@ pub async fn sandbox_create(
                     provisioning_idle_deadline = Instant::now() + provision_timeout;
                 }
 
-                if let Some(d) = display.as_mut() {
-                    // Unknown events: show as detail on the current spinner.
-                    if !ev.message.is_empty() {
-                        d.set_active_detail(&ev.message);
-                    }
+                if let Some(d) = display.as_interactive_mut()
+                    && !ev.message.is_empty()
+                {
+                    d.set_active_detail(&ev.message);
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Warning(w)) => {
-                if let Some(d) = display.as_mut() {
-                    d.println(&format!("  {} {}", "!".yellow().bold(), w.message.yellow()));
-                } else {
-                    let ts = format_timestamp(provision_start.elapsed());
-                    eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
+                match &display {
+                    ProgressOutput::Interactive(d) => {
+                        d.println(&format!("  {} {}", "!".yellow().bold(), w.message.yellow()));
+                    }
+                    ProgressOutput::Plain | ProgressOutput::Silent => {
+                        let ts = format_timestamp(provision_start.elapsed());
+                        eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
+                    }
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_))
@@ -2317,7 +2201,7 @@ pub async fn sandbox_create(
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
     if final_phase != SandboxPhase::Ready
-        && let Some(d) = display.as_mut()
+        && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
             let msg = if last_error_reason.is_empty() {
@@ -2425,6 +2309,11 @@ pub async fn sandbox_create(
                     "  Stop with: openshell forward stop {} {sandbox_name}",
                     spec.port,
                 );
+            }
+
+            if structured_output {
+                crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
+                return Ok(());
             }
 
             if let Some(editor) = editor {
@@ -2765,6 +2654,7 @@ pub async fn sandbox_get(
     server: &str,
     name: &str,
     policy_only: bool,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -2803,6 +2693,11 @@ pub async fn sandbox_get(
         let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
             .wrap_err("failed to serialize policy to YAML")?;
         print!("{yaml_str}");
+        return Ok(());
+    }
+
+    let detail_json = sandbox_detail_to_json(&sandbox, &config)?;
+    if crate::output::print_output_single(output, &detail_json, Clone::clone)? {
         return Ok(());
     }
 
@@ -3450,63 +3345,6 @@ async fn sandbox_exec_interactive_grpc(
     Ok(exit_code)
 }
 
-/// Print a single YAML line with dimmed keys and regular values.
-fn print_yaml_line(line: &str) {
-    // Find leading whitespace
-    let trimmed = line.trim_start();
-    let indent = &line[..line.len() - trimmed.len()];
-
-    // Handle list items
-    if let Some(rest) = trimmed.strip_prefix("- ") {
-        print!("{indent}");
-        print!("{}", "- ".dimmed());
-        print!("{rest}");
-        println!();
-        return;
-    }
-
-    // Handle key: value pairs
-    if let Some(colon_pos) = trimmed.find(':') {
-        let key = &trimmed[..colon_pos];
-        let after_colon = &trimmed[colon_pos + 1..];
-
-        print!("{indent}");
-        print!("{}", key.dimmed());
-        print!("{}", ":".dimmed());
-
-        if after_colon.is_empty() {
-            // Key with nested content (no value on this line)
-        } else if let Some(value) = after_colon.strip_prefix(' ') {
-            // Key: value
-            print!(" {value}");
-        } else {
-            // Shouldn't happen in valid YAML, but handle it
-            print!("{after_colon}");
-        }
-        println!();
-        return;
-    }
-
-    // Plain line (shouldn't happen often in YAML)
-    println!("{line}");
-}
-
-/// Print sandbox policy as YAML with dimmed keys.
-fn print_sandbox_policy(policy: &SandboxPolicy) {
-    println!("{}", "Policy:".cyan().bold());
-    println!();
-    if let Ok(yaml_str) = openshell_policy::serialize_sandbox_policy(policy) {
-        // Indent the YAML output and skip the initial "---" line
-        for line in yaml_str.lines() {
-            if line == "---" {
-                continue;
-            }
-            print!("  ");
-            print_yaml_line(line);
-        }
-    }
-}
-
 /// List sandboxes.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_list(
@@ -3656,6 +3494,48 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
     })
+}
+
+fn sandbox_detail_to_json(
+    sandbox: &Sandbox,
+    config: &GetSandboxConfigResponse,
+) -> Result<serde_json::Value> {
+    let mut value = sandbox_to_json(sandbox);
+    let obj = value
+        .as_object_mut()
+        .expect("sandbox_to_json returns object");
+
+    let policy_source = if config.policy_source == PolicySource::Global as i32 {
+        "global"
+    } else {
+        "sandbox"
+    };
+    obj.insert("policy_source".into(), serde_json::json!(policy_source));
+
+    let policy_from_global = config.policy_source == PolicySource::Global as i32;
+    let revision = if policy_from_global {
+        if config.global_policy_version > 0 {
+            Some(config.global_policy_version)
+        } else if config.version > 0 {
+            Some(config.version)
+        } else {
+            None
+        }
+    } else if config.version > 0 {
+        Some(config.version)
+    } else {
+        None
+    };
+    obj.insert("revision".into(), serde_json::json!(revision));
+
+    let policy_json = match config.policy.as_ref() {
+        Some(p) => openshell_policy::sandbox_policy_to_json_value(p)
+            .wrap_err("failed to convert policy to JSON")?,
+        None => serde_json::Value::Null,
+    };
+    obj.insert("policy".into(), policy_json);
+
+    Ok(value)
 }
 
 pub async fn sandbox_provider_list(
@@ -4226,196 +4106,6 @@ async fn auto_create_provider(
 
     eprintln!();
     Ok(())
-}
-
-pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-
-    for item in items {
-        let Some((key, value)) = item.split_once('=') else {
-            return Err(miette::miette!("{flag} expects KEY=VALUE, got '{item}'"));
-        };
-
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(miette::miette!("{flag} key cannot be empty"));
-        }
-
-        map.insert(key.to_string(), value.to_string());
-    }
-
-    Ok(map)
-}
-
-pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
-    let map = parse_key_value_pairs(items, "--env")?;
-    for key in map.keys() {
-        if !is_valid_env_name(key) {
-            return Err(miette::miette!(
-                "--env key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
-            ));
-        }
-        if key.starts_with("OPENSHELL_") {
-            return Err(miette::miette!(
-                "--env keys starting with OPENSHELL_ are reserved; got '{key}'"
-            ));
-        }
-    }
-    Ok(map)
-}
-
-/// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
-/// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
-pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-
-    for item in items {
-        let (key, env_name) = match item.split_once('=') {
-            Some((key, env_name)) => (key.trim(), env_name.trim()),
-            None => (item.trim(), item.trim()),
-        };
-        if key.is_empty() {
-            return Err(miette::miette!("--secret-material-env key cannot be empty"));
-        }
-        if env_name.is_empty() {
-            return Err(miette::miette!(
-                "--secret-material-env {key} names an empty environment variable"
-            ));
-        }
-
-        let value = std::env::var(env_name).map_err(|_| {
-            miette::miette!(
-                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
-            )
-        })?;
-        if value.trim().is_empty() {
-            return Err(miette::miette!(
-                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
-            ));
-        }
-
-        if map.contains_key(key) {
-            return Err(miette::miette!(
-                "--secret-material-env key '{key}' supplied more than once"
-            ));
-        }
-        map.insert(key.to_string(), value);
-    }
-
-    Ok(map)
-}
-
-fn is_valid_env_name(key: &str) -> bool {
-    let mut bytes = key.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    if !(first == b'_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
-}
-
-fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-
-    for item in items {
-        if let Some((key, value)) = item.split_once('=') {
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(miette::miette!("--credential key cannot be empty"));
-            }
-            map.insert(key.to_string(), value.to_string());
-            continue;
-        }
-
-        let key = item.trim();
-        if key.is_empty() {
-            return Err(miette::miette!("--credential key cannot be empty"));
-        }
-
-        let value = std::env::var(key).map_err(|_| {
-            miette::miette!(
-                "--credential {key} requires local env var '{key}' to be set to a non-empty value"
-            )
-        })?;
-
-        if value.trim().is_empty() {
-            return Err(miette::miette!(
-                "--credential {key} requires local env var '{key}' to be set to a non-empty value"
-            ));
-        }
-
-        map.insert(key.to_string(), value);
-    }
-
-    Ok(map)
-}
-
-pub fn parse_credential_expiry_cli_value(value: &str) -> std::result::Result<i64, String> {
-    parse_credential_expiry_value(value, None).map_err(|err| err.to_string())
-}
-
-fn credential_expiry_value_error(key: Option<&str>, detail: &str) -> miette::Report {
-    key.map_or_else(
-        || miette::miette!("--credential-expires-at value {detail}"),
-        |key| miette::miette!("--credential-expires-at value for '{key}' {detail}"),
-    )
-}
-
-fn parse_credential_expiry_value(value: &str, key: Option<&str>) -> Result<i64> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(credential_expiry_value_error(key, "cannot be empty"));
-    }
-
-    if let Ok(value_ms) = value.parse::<i64>() {
-        if value_ms < 0 {
-            return Err(credential_expiry_value_error(
-                key,
-                "must be greater than or equal to 0",
-            ));
-        }
-        return Ok(value_ms);
-    }
-
-    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
-        credential_expiry_value_error(
-            key,
-            "must be a Unix epoch millisecond timestamp or RFC3339 timestamp",
-        )
-    })?;
-    let value_ms = parsed.timestamp_millis();
-    if value_ms < 0 {
-        return Err(credential_expiry_value_error(
-            key,
-            "must be greater than or equal to 0",
-        ));
-    }
-
-    Ok(value_ms)
-}
-
-fn parse_credential_expiry_pairs(items: &[String]) -> Result<HashMap<String, i64>> {
-    let mut map = HashMap::new();
-
-    for item in items {
-        let Some((key, value)) = item.split_once('=') else {
-            return Err(miette::miette!(
-                "--credential-expires-at expects KEY=TIMESTAMP, got '{item}'"
-            ));
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(miette::miette!(
-                "--credential-expires-at key cannot be empty"
-            ));
-        }
-        let value = parse_credential_expiry_value(value, Some(key))?;
-        map.insert(key.to_string(), value);
-    }
-
-    Ok(map)
 }
 
 pub async fn service_expose(
@@ -5903,27 +5593,6 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     )
 }
 
-fn format_optional_epoch_ms(ms: i64) -> String {
-    if ms > 0 {
-        format_epoch_ms(ms)
-    } else {
-        "-".to_string()
-    }
-}
-
-fn truncate_status_field(value: &str, max_chars: usize) -> String {
-    if value.is_empty() {
-        return "-".to_string();
-    }
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
 fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
     match strategy {
         ProviderCredentialRefreshStrategy::Static => "static",
@@ -6005,6 +5674,17 @@ fn load_profile_import_item(
         }
     }
     .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
+
+    let pre_lower = profile.validate_before_lowering(&source);
+    if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
+        return Err(ProviderProfileDiagnostic {
+            source: diag.source,
+            profile_id: diag.profile_id,
+            field: diag.field,
+            message: diag.message,
+            severity: diag.severity,
+        });
+    }
 
     Ok(ProviderProfileImportItem {
         profile: Some(profile.to_proto()),
@@ -6159,17 +5839,6 @@ fn print_provider_type_row(
         profile.endpoints.len(),
         inference
     );
-}
-
-fn truncate_display(value: &str, max_width: usize) -> String {
-    if value.chars().count() <= max_width {
-        return value.to_string();
-    }
-
-    let keep = max_width.saturating_sub(3);
-    let mut truncated = value.chars().take(keep).collect::<String>();
-    truncated.push_str("...");
-    truncated
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7119,173 +6788,9 @@ pub async fn sandbox_upload(
     Ok(())
 }
 
-fn scrub_git_env(command: &mut Command) -> &mut Command {
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_PREFIX",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    ] {
-        command.env_remove(key);
-    }
-    command
-}
-
 // ---------------------------------------------------------------------------
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
-
-/// Parse a duration string like "5m", "1h", "30s" into milliseconds.
-fn parse_duration_to_ms(s: &str) -> Result<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(miette::miette!("empty duration string"));
-    }
-    let (num_str, unit) = s.split_at(s.len() - 1);
-    let num: i64 = num_str
-        .parse()
-        .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
-    let multiplier = match unit {
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        _ => {
-            return Err(miette::miette!(
-                "unknown duration unit: {unit} (use s, m, or h)"
-            ));
-        }
-    };
-    Ok(num * multiplier)
-}
-
-fn confirm_global_setting_takeover(key: &str, yes: bool) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
-
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(miette::miette!(
-            "global setting updates require confirmation; pass --yes in non-interactive mode"
-        ));
-    }
-
-    let proceed = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "Setting '{key}' globally will disable sandbox-level management for this key. Continue?"
-        ))
-        .default(false)
-        .interact()
-        .into_diagnostic()?;
-
-    if !proceed {
-        return Err(miette::miette!("aborted by user"));
-    }
-
-    Ok(())
-}
-
-fn confirm_global_setting_delete(key: &str, yes: bool) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
-
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(miette::miette!(
-            "global setting deletes require confirmation; pass --yes in non-interactive mode"
-        ));
-    }
-
-    let proceed = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "Deleting global setting '{key}' re-enables sandbox-level management for this key. Continue?"
-        ))
-        .default(false)
-        .interact()
-        .into_diagnostic()?;
-
-    if !proceed {
-        return Err(miette::miette!("aborted by user"));
-    }
-
-    Ok(())
-}
-
-fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
-    let setting = settings::setting_for_key(key).ok_or_else(|| {
-        miette::miette!(
-            "unknown setting key '{}'. Allowed keys: {}",
-            key,
-            settings::registered_keys_csv()
-        )
-    })?;
-
-    let value = match setting.kind {
-        SettingValueKind::String => {
-            // Reject typos client-side so `openshell settings set ...
-            // proposal_approval_mode autom` errors immediately instead of
-            // round-tripping through the server. The server enforces the
-            // same check independently for non-CLI callers.
-            setting
-                .validate_string_value(raw_value)
-                .map_err(|allowed| {
-                    miette::miette!(
-                        "invalid value '{}' for key '{}'; expected one of: {}",
-                        raw_value,
-                        key,
-                        allowed.join(", ")
-                    )
-                })?;
-            setting_value::Value::StringValue(raw_value.to_string())
-        }
-        SettingValueKind::Int => {
-            let parsed = raw_value.trim().parse::<i64>().map_err(|_| {
-                miette::miette!(
-                    "invalid int value '{}' for key '{}'; expected base-10 integer",
-                    raw_value,
-                    key
-                )
-            })?;
-            setting_value::Value::IntValue(parsed)
-        }
-        SettingValueKind::Bool => {
-            let parsed = settings::parse_bool_like(raw_value).ok_or_else(|| {
-                miette::miette!(
-                    "invalid bool value '{}' for key '{}'; expected one of: true,false,yes,no,1,0",
-                    raw_value,
-                    key
-                )
-            })?;
-            setting_value::Value::BoolValue(parsed)
-        }
-    };
-
-    Ok(SettingValue { value: Some(value) })
-}
-
-fn format_setting_value(value: Option<&SettingValue>) -> String {
-    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
-        return "<unset>".to_string();
-    };
-    match value {
-        setting_value::Value::StringValue(v) => v.clone(),
-        setting_value::Value::BoolValue(v) => v.to_string(),
-        setting_value::Value::IntValue(v) => v.to_string(),
-        setting_value::Value::BytesValue(v) => format!("<bytes:{}>", v.len()),
-    }
-}
-
-fn short_hash(hash: &str) -> &str {
-    if hash.len() >= 12 { &hash[..12] } else { hash }
-}
-
-fn print_policy_merge_warnings(warnings: &[openshell_policy::PolicyMergeWarning]) {
-    for warning in warnings {
-        eprintln!("{} {}", "!".yellow().bold(), warning);
-    }
-}
 
 pub async fn sandbox_policy_set_global(
     server: &str,
@@ -7440,7 +6945,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
 fn settings_to_json_sandbox(
     name: &str,
     workspace: &str,
-    response: &openshell_core::proto::GetSandboxConfigResponse,
+    response: &GetSandboxConfigResponse,
 ) -> serde_json::Value {
     let policy_source = if response.policy_source == PolicySource::Global as i32 {
         "global"
@@ -8859,46 +8364,28 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     format!("{host_port} [{}]", tags.join(", "))
 }
 
-fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
-    if value.is_empty() { fallback } else { value }
-}
-
-/// Format a millisecond timestamp into a readable string.
-fn format_timestamp_ms(ms: i64) -> String {
-    if ms <= 0 {
-        return "-".to_string();
-    }
-    let secs = ms / 1000;
-    let mins = (secs / 60) % 60;
-    let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days}d {hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayInfoView, PolicyGetView,
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
-        format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_info_to_json,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
+        GatewayInfoView, PolicyGetView, ProvisioningStep, TlsOptions,
+        build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items,
+        format_provider_attachment_table, gateway_add, gateway_auth_label,
+        gateway_authentication_state, gateway_env_override_warning, gateway_info_to_json,
         gateway_remote_label, gateway_select_with, gateway_to_json, gateway_type_label,
         git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
+        plaintext_gateway_is_remote, policy_revision_to_json,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
         service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
+    use crate::commands::common::progress_step_from_metadata;
     use hyper::StatusCode;
     use std::fs;
     use std::io::{Read, Write};
@@ -8917,12 +8404,83 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, PolicyStatus, Provider, ProviderCredentialRefresh,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxPolicyRevision, SandboxStatus,
-        datamodel::v1::ObjectMeta,
+        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
+        ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
+        SandboxPolicyRevision, SandboxStatus, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn gateway_status_reports_authenticated_oidc_probe() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("token".to_string());
+
+        let state = gateway_authentication_state(Ok(()), &tls, "https://gateway.example.com");
+
+        assert_eq!(state, GatewayAuthenticationState::Authenticated("OIDC"));
+    }
+
+    #[test]
+    fn gateway_status_treats_authorization_denial_as_authenticated() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("token".to_string());
+
+        let state = gateway_authentication_state(
+            Err(Status::permission_denied("role 'openshell-admin' required")),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(
+            state,
+            GatewayAuthenticationState::Authenticated("OIDC; authorization denied")
+        );
+    }
+
+    #[test]
+    fn gateway_status_reports_rejected_bearer_token() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("expired".to_string());
+
+        let state = gateway_authentication_state(
+            Err(Status::unauthenticated("invalid token: ExpiredSignature")),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(
+            state,
+            GatewayAuthenticationState::Failed("invalid token: ExpiredSignature".to_string())
+        );
+    }
+
+    #[test]
+    fn gateway_status_marks_oidc_unverified_on_older_gateway() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("token".to_string());
+
+        let state = gateway_authentication_state(
+            Err(Status::unimplemented("unknown service")),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(
+            state,
+            GatewayAuthenticationState::Unverified(
+                "gateway does not support authentication checks".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_status_reports_local_plaintext_auth_not_required() {
+        let state =
+            gateway_authentication_state(Ok(()), &TlsOptions::default(), "http://127.0.0.1:8080");
+
+        assert_eq!(state, GatewayAuthenticationState::NotRequired("gateway"));
+    }
 
     #[test]
     fn policy_revision_json_includes_revision_provenance() {
@@ -10949,5 +10507,125 @@ mod tests {
             json.get("created_at_ms").is_none(),
             "raw milliseconds field should not exist"
         );
+    }
+
+    #[test]
+    fn sandbox_detail_to_json_includes_policy_fields() {
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-123".to_string(),
+                name: "test-sb".to_string(),
+                resource_version: 5,
+                created_at_ms: 1_609_459_200_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.set_current_policy_version(2);
+
+        let config = GetSandboxConfigResponse {
+            policy_source: PolicySource::Global as i32,
+            global_policy_version: 3,
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(&sandbox, &config).unwrap();
+
+        assert_eq!(json["id"], "sb-123");
+        assert_eq!(json["name"], "test-sb");
+        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["policy_source"], "global");
+        assert_eq!(json["revision"], 3);
+        assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn sandbox_detail_to_json_sandbox_source_without_policy() {
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-456".to_string(),
+                name: "no-policy-sb".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = GetSandboxConfigResponse {
+            policy_source: PolicySource::Sandbox as i32,
+            version: 0,
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(&sandbox, &config).unwrap();
+
+        assert_eq!(json["policy_source"], "sandbox");
+        assert!(json["revision"].is_null());
+        assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn status_to_json_connected() {
+        let auth = GatewayAuthenticationState::Authenticated("mTLS transport");
+        let json = super::status_to_json(
+            "my-gw",
+            "http://127.0.0.1:8090",
+            false,
+            "connected",
+            &Some("1.2.3".to_string()),
+            &None,
+            &None,
+            &auth,
+        );
+
+        assert_eq!(json["gateway"], "my-gw");
+        assert_eq!(json["server"], "http://127.0.0.1:8090");
+        assert_eq!(json["status"], "connected");
+        assert_eq!(json["version"], "1.2.3");
+        assert_eq!(json["authentication"]["status"], "authenticated");
+        assert!(json.get("auth").is_none());
+        assert!(json.get("error").is_none());
+        assert!(json.get("http_status").is_none());
+    }
+
+    #[test]
+    fn status_to_json_disconnected_with_error() {
+        let auth = GatewayAuthenticationState::Unverified("gateway unreachable".to_string());
+        let json = super::status_to_json(
+            "broken-gw",
+            "http://10.0.0.1:8090",
+            false,
+            "disconnected",
+            &None,
+            &Some("connection refused".to_string()),
+            &None,
+            &auth,
+        );
+
+        assert_eq!(json["status"], "disconnected");
+        assert_eq!(json["error"], "connection refused");
+        assert_eq!(json["authentication"]["status"], "unverified");
+        assert!(json.get("version").is_none());
+    }
+
+    #[test]
+    fn status_to_json_connected_http_with_bearer() {
+        let auth = GatewayAuthenticationState::Failed("token expired".to_string());
+        let json = super::status_to_json(
+            "edge-gw",
+            "https://edge.example.com",
+            true,
+            "connected_http",
+            &None,
+            &Some("gRPC unavailable".to_string()),
+            &Some("200 OK".to_string()),
+            &auth,
+        );
+
+        assert_eq!(json["status"], "connected_http");
+        assert_eq!(json["auth"], "edge_bearer");
+        assert_eq!(json["error"], "gRPC unavailable");
+        assert_eq!(json["http_status"], "200 OK");
+        assert_eq!(json["authentication"]["status"], "failed");
+        assert!(json.get("version").is_none());
     }
 }
