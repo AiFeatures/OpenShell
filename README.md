@@ -1,4 +1,4 @@
-# ![OpenShell](docs/brand/assets/openshell-lockup-horizontal.svg)
+# NVIDIA OpenShell
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
