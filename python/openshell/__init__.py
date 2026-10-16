@@ -5,17 +5,26 @@
 
 from __future__ import annotations
 
+from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
+from .mutations import DeletionOutcome, DeletionResult
+from .providers import ProviderClient, ProviderCredentialValue
 from .sandbox import (
+    ClientCredentialsAuth,
     ExecChunk,
     ExecResult,
-    InferenceRouteClient,
-    InferenceRouteConfig,
+    Page,
+    Pager,
     Sandbox,
     SandboxClient,
+    SandboxConditionRef,
     SandboxError,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
+    SandboxTemplateClient,
+    SandboxWorkloadTemplateProvenanceRef,
+    ServiceAuthorizationMode,
+    ServiceExposure,
     TlsConfig,
     WorkspaceClient,
     WorkspaceRef,
@@ -29,18 +38,32 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ClientCredentialsAuth",
+    "DeletionOutcome",
+    "DeletionResult",
+    "ErrorInfo",
     "ExecChunk",
     "ExecResult",
-    "InferenceRouteClient",
-    "InferenceRouteConfig",
+    "FieldViolation",
+    "GatewayError",
+    "Page",
+    "Pager",
+    "ProviderClient",
+    "ProviderCredentialValue",
     "Sandbox",
     "SandboxClient",
+    "SandboxConditionRef",
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
+    "SandboxTemplateClient",
+    "SandboxWorkloadTemplateProvenanceRef",
+    "ServiceAuthorizationMode",
+    "ServiceExposure",
     "TlsConfig",
     "WorkspaceClient",
     "WorkspaceRef",
     "__version__",
+    "from_grpc_error",
 ]

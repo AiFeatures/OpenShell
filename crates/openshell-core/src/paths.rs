@@ -20,6 +20,10 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("APPDATA") {
+        return Ok(PathBuf::from(path));
+    }
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
@@ -38,6 +42,10 @@ pub fn xdg_state_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
+        return Ok(PathBuf::from(path));
+    }
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
@@ -49,11 +57,33 @@ pub fn openshell_state_dir() -> Result<PathBuf> {
     Ok(xdg_state_dir()?.join("openshell"))
 }
 
+/// Platform default for gateway audit files. Sink configuration and writing
+/// remain portable; only the directory convention depends on the host.
+pub fn gateway_audit_log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(directory) = std::env::var_os("ProgramData") {
+            return PathBuf::from(directory).join("OpenShell").join("logs");
+        }
+        std::env::temp_dir().join("openshell").join("logs")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        openshell_state_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("openshell"))
+            .join("logs")
+    }
+}
+
 /// Resolve the XDG data base directory.
 ///
 /// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.
 pub fn xdg_data_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME")
@@ -128,32 +158,9 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
-/// Normalize a filesystem path by collapsing redundant separators
-/// and removing trailing slashes, without requiring the path to exist on disk.
-///
-/// This is a lexical normalization only — it does NOT resolve symlinks or
-/// check the filesystem. `..` components are preserved verbatim; callers that
-/// need to reject parent traversal must validate separately.
-pub fn normalize_path(path: &str) -> String {
-    use std::path::Component;
-
-    let p = Path::new(path);
-    let mut normalized = PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            #[allow(clippy::path_buf_push_overwrite)]
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {} // skip "."
-            Component::ParentDir => {
-                // Keep ".." — validation will catch it separately
-                normalized.push("..");
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
-    }
-    normalized.to_string_lossy().to_string()
-}
+/// Compatibility re-export; authored policy path normalization is owned by
+/// `openshell-policy-schema`.
+pub use openshell_policy_schema::normalize_path;
 
 #[cfg(test)]
 mod tests {

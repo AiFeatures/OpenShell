@@ -2,18 +2,19 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Link to the issue this addresses: Fixes #NNN or Closes #NNN -->
+<!-- Every PR must close an existing issue covering its scope, except automated dependency updates. Use Closes #NNN; see CONTRIBUTING.md for the exception. Authors without repository write access must link at least one issue with state:accepted. PR body text cannot bypass this acceptance check. -->
 
 ## Changes
 <!-- Bullet list of key changes -->
 
 ## Testing
-<!-- What testing was done? -->
-- [ ] `mise run pre-commit` passes
-- [ ] Unit tests added/updated
+<!-- Report current verification performed for this implementation. Do not copy diagnostics from the original issue. -->
+- [ ] Checks appropriate to the affected code and behavior pass
+- [ ] Unit tests added/updated (if applicable)
 - [ ] E2E tests added/updated (if applicable)
 
 ## Checklist
+
 - [ ] Follows [Conventional Commits](https://www.conventionalcommits.org/)
 - [ ] Commits are signed off (DCO)
 - [ ] Architecture docs updated (if applicable)

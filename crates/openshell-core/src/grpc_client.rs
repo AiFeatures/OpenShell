@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC client for fetching sandbox policy, provider environment, and inference
-//! route bundles from `OpenShell` server.
+//! gRPC client for fetching sandbox policy and provider environment from the
+//! `OpenShell` server.
 //!
 //! Every request carries a sandbox bearer credential in the `Authorization`
 //! header. The token is resolved at startup from one of three sources:
@@ -22,21 +22,36 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::endpoint_status::{EndpointResult, EndpointStatusSnapshot};
 use crate::proto::{
-    DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
+    DenialSummary, EndpointObservation as ProtoEndpointObservation,
+    EndpointResult as ProtoEndpointResult, ExchangeProviderSubjectTokenRequest,
+    GetDraftPolicyRequest, GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, IssueSandboxTokenRequest, NetworkActivitySummary,
+    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    ReportEndpointStatusRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
     open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
+use crate::time::{duration_to_std, timestamp_to_millis};
+use crate::token_grant_failure::{TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_extension_core::{BearerTokenSlot, ExtensionCredentialStore};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, info, warn};
+
+/// Preserve the gRPC status as a source so callers can classify retryable errors.
+/// `IntoDiagnostic` alone hides the wrapped error's concrete type.
+pub fn grpc_status_error(status: Status) -> miette::Report {
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("{0}")]
+    struct GrpcStatusError(#[source] Status);
+    GrpcStatusError(status).into()
+}
 
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
 /// generated client type signatures stay readable.
@@ -69,6 +84,9 @@ static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 
+#[cfg(feature = "jwt")]
+static SANDBOX_BEARER_SLOT: OnceLock<crate::jwt::SessionBearerTokenSlot> = OnceLock::new();
+
 #[derive(Clone, Debug)]
 enum RefreshMode {
     GatewayJwt(TokenSource),
@@ -81,16 +99,76 @@ struct AcquiredToken {
 }
 
 fn install_token_slot(token: &str) -> Result<TokenSlot> {
-    let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+    let bearer = validate_gateway_bearer(token)?;
+    Ok(install_validated_token_slot(bearer))
+}
+
+fn validate_gateway_bearer(token: &str) -> Result<AsciiMetadataValue> {
+    AsciiMetadataValue::try_from(format!("Bearer {token}"))
         .into_diagnostic()
-        .wrap_err("sandbox JWT contained characters not valid for a header value")?;
+        .wrap_err("sandbox JWT contained characters not valid for a header value")
+}
+
+fn install_validated_token_slot(bearer: AsciiMetadataValue) -> TokenSlot {
     if let Some(existing) = TOKEN_SLOT.get() {
-        *existing.write().expect("token slot poisoned") = bearer;
-        return Ok(existing.clone());
+        *existing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bearer;
+        return existing.clone();
     }
     let slot: TokenSlot = Arc::new(RwLock::new(bearer));
     let _ = TOKEN_SLOT.set(slot.clone());
-    Ok(TOKEN_SLOT.get().cloned().unwrap_or(slot))
+    TOKEN_SLOT.get().cloned().unwrap_or(slot)
+}
+
+#[cfg(feature = "jwt")]
+struct ValidatedSandboxRefresh {
+    token: crate::jwt::SecretJwt,
+    expires_at: i64,
+    credential_epoch: crate::jwt::CredentialEpoch,
+}
+
+#[cfg(feature = "jwt")]
+fn validate_sandbox_refresh(
+    response: &crate::proto::RefreshSandboxTokenResponse,
+) -> std::result::Result<ValidatedSandboxRefresh, crate::jwt::SessionJwtError> {
+    let token = crate::jwt::SecretJwt::parse(response.sandbox_token.clone())?;
+    let credential_epoch = crate::jwt::CredentialEpoch::new(response.credential_epoch)?;
+    let expires_at = response
+        .sandbox_expiration_time
+        .as_ref()
+        .map(|expiration_time| {
+            crate::time::validate_timestamp(expiration_time)
+                .map_err(|_| crate::jwt::SessionJwtError::InvalidLifetime)?;
+            if expiration_time.seconds == 0 {
+                return Err(crate::jwt::SessionJwtError::InvalidLifetime);
+            }
+            Ok(expiration_time.seconds)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    crate::jwt::SessionBearerTokenSlot::new(token.clone(), expires_at, credential_epoch)?;
+    Ok(ValidatedSandboxRefresh {
+        token,
+        expires_at,
+        credential_epoch,
+    })
+}
+
+/// Install the gateway-session credential supplied in trusted supervisor
+/// launch state before any gateway client is constructed.
+#[cfg(feature = "jwt")]
+pub fn install_supervisor_auth_bundle(
+    bundle: &crate::jwt::SupervisorAuthBundle,
+) -> Result<crate::jwt::SessionBearerTokenSlot> {
+    install_token_slot(bundle.gateway_token.expose_secret())?;
+    let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::File));
+    let slot = bundle
+        .sandbox_bearer_slot()
+        .into_diagnostic()
+        .wrap_err("invalid Sandbox Protocol credential")?;
+    let _ = SANDBOX_BEARER_SLOT.set(slot.clone());
+    Ok(SANDBOX_BEARER_SLOT.get().cloned().unwrap_or(slot))
 }
 
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
@@ -118,16 +196,18 @@ impl tonic::service::Interceptor for AuthInterceptor {
             .expect("auth interceptor token slot poisoned")
             .clone();
         req.metadata_mut().insert("authorization", bearer);
+        #[cfg(feature = "trace-context")]
+        let req =
+            tonic::service::Interceptor::call(&mut openshell_otel::TraceContextInterceptor, req)?;
         Ok(req)
     }
 }
 
 /// Build the plain (un-intercepted) gRPC channel.
 ///
-/// When the endpoint uses `https://`, mTLS is configured using these env vars:
+/// When the endpoint uses `https://`, server-authenticated TLS is configured
+/// using this env var:
 /// - `OPENSHELL_TLS_CA` -- path to the CA certificate
-/// - `OPENSHELL_TLS_CERT` -- path to the client certificate
-/// - `OPENSHELL_TLS_KEY` -- path to the client private key
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
@@ -146,30 +226,29 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 
     let tls_enabled = endpoint.starts_with("https://");
 
+    // TODO: The TLS CA is loaded once here and never re-read. The gateway
+    // server side supports hot-reload (ArcSwap + notify in tls.rs). The
+    // supervisor should do the same so that cert-manager rotations take
+    // effect without restarting the sandbox.
     if tls_enabled {
         let ca_path = std::env::var(sandbox_env::TLS_CA)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CA is required")?;
-        let cert_path = std::env::var(sandbox_env::TLS_CERT)
-            .into_diagnostic()
-            .wrap_err("OPENSHELL_TLS_CERT is required")?;
-        let key_path = std::env::var(sandbox_env::TLS_KEY)
-            .into_diagnostic()
-            .wrap_err("OPENSHELL_TLS_KEY is required")?;
-
         let ca_pem = std::fs::read(&ca_path)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
-        let cert_pem = std::fs::read(&cert_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read client cert from {cert_path}"))?;
-        let key_pem = std::fs::read(&key_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
-        let mut tls_config = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca_pem))
-            .identity(Identity::from_pem(cert_pem, key_pem));
+        // Trust only the configured CA — this is the chart's internal CA
+        // that signs the gateway's internal server certificate. The gateway uses SNI-based
+        // certificate selection to present this internal cert to supervisor
+        // connections, so no public root trust is needed here.
+        //
+        // Do NOT add `.with_native_roots()` or `.with_webpki_roots()` here:
+        // the supervisor runs inside the user-selected sandbox image
+        // (Docker/Podman drivers), and broadening the trust store would let
+        // an attacker who controls the image + DNS present a publicly valid
+        // certificate and intercept the supervisor→gateway TLS connection.
+        let mut tls_config = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem));
         if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
             && !server_name.is_empty()
         {
@@ -186,6 +265,34 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
         .await
         .into_diagnostic()
         .wrap_err("failed to connect to OpenShell server")
+}
+
+/// Marks the current client span failed unless the call finishes successfully.
+struct ClientSpanStatus {
+    span: tracing::Span,
+    finished: bool,
+}
+
+impl ClientSpanStatus {
+    fn current() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            finished: false,
+        }
+    }
+
+    fn finish<T, E>(mut self, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
+        self.finished = result.is_ok();
+        result
+    }
+}
+
+impl Drop for ClientSpanStatus {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.span.record("otel.status_code", "ERROR");
+        }
+    }
 }
 
 /// Build a Bearer-authenticated channel to the gateway.
@@ -321,6 +428,26 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
 }
 
+/// Report installed provider state for the current authenticated supervisor session.
+///
+/// The observation must carry the session ID returned by `ConnectSupervisor`.
+/// Reconnects start a new report sequence; retries preserve the complete report.
+pub async fn report_provider_readiness(
+    endpoint: &str,
+    sandbox_id: &str,
+    observation: crate::proto::ProviderReadinessObservation,
+) -> Result<crate::proto::ReportProviderReadinessResponse> {
+    let mut client = connect(endpoint).await?;
+    client
+        .report_provider_readiness(crate::proto::ReportProviderReadinessRequest {
+            sandbox_id: sandbox_id.to_string(),
+            observation: Some(observation),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .into_diagnostic()
+}
+
 /// Background task that renews the sandbox JWT at ~80% of its remaining
 /// lifetime. The new token replaces the value in [`TOKEN_SLOT`], so all
 /// in-flight and future clients pick it up on their next request. The
@@ -335,23 +462,50 @@ async fn refresh_token_loop(
 ) {
     let mut client = OpenShellClient::new(channel);
     loop {
-        let sleep = compute_refresh_delay(&slot);
+        let Some(sleep) = compute_refresh_delay(&slot) else {
+            debug!("gateway sandbox JWT does not expire; stopping periodic renewal");
+            return;
+        };
         tokio::time::sleep(sleep).await;
         match client
-            .refresh_sandbox_token(RefreshSandboxTokenRequest {})
+            .refresh_sandbox_token(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            })
             .await
         {
             Ok(resp) => {
-                let new_token = resp.into_inner().token;
-                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                    Ok(value) => {
-                        if let Ok(mut guard) = slot.write() {
-                            *guard = value;
-                            info!("renewed gateway sandbox JWT in-place");
-                        }
+                let response = resp.into_inner();
+                #[cfg(feature = "jwt")]
+                let sandbox_refresh = match validate_sandbox_refresh(&response) {
+                    Ok(refresh) => refresh,
+                    Err(error) => {
+                        warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
+                        continue;
                     }
-                    Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
+                };
+                let gateway_bearer = match validate_gateway_bearer(&response.token) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(%error, "refreshed JWT contained invalid header bytes");
+                        continue;
+                    }
+                };
+
+                *slot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway_bearer;
+                #[cfg(feature = "jwt")]
+                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get()
+                    && let Err(error) = sandbox_slot.update(
+                        sandbox_refresh.token,
+                        sandbox_refresh.expires_at,
+                        sandbox_refresh.credential_epoch,
+                    )
+                    && error != crate::jwt::SessionJwtError::StaleCredentialEpoch
+                {
+                    warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
                 }
+                info!("renewed gateway and Sandbox Protocol credentials in-place");
             }
             Err(status) => {
                 if status.code() == tonic::Code::Unauthenticated
@@ -403,41 +557,153 @@ async fn refresh_token_loop(
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Registration names to request credentials for.
+///
+/// Registrations the operator opted out of extension authentication have no
+/// credential to request; asking for one is rejected by the gateway.
+fn authenticated_service_names(
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Vec<String> {
+    services
+        .iter()
+        .filter(|service| !service.allow_insecure_transport)
+        .map(|service| service.name.clone())
+        .collect()
+}
+
+async fn refresh_extension_credentials_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    store: &ExtensionCredentialStore,
+    services: &[crate::proto::SupervisorMiddlewareService],
+) -> Result<HashMap<String, BearerTokenSlot>> {
+    let names = authenticated_service_names(services);
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let response = client
+        .refresh_sandbox_token(RefreshSandboxTokenRequest {
+            extension_service_names: names.clone(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to refresh extension service credentials")?
+        .into_inner();
+
+    let gateway_bearer = validate_gateway_bearer(&response.token)?;
+    #[cfg(feature = "jwt")]
+    let sandbox_refresh = validate_sandbox_refresh(&response)
+        .into_diagnostic()
+        .wrap_err("gateway returned an invalid Sandbox Protocol credential")?;
+
+    // Validate the whole response before mutating any slot, so a malformed or
+    // partial reply cannot leave the store half-rotated.
+    let expected = names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut validated = HashMap::with_capacity(response.extension_credentials.len());
+    for credential in response.extension_credentials {
+        if !expected.contains(credential.service_name.as_str())
+            || validated.contains_key(&credential.service_name)
+        {
+            return Err(miette::miette!(
+                "gateway returned an unexpected or duplicate extension credential"
+            ));
+        }
+        let expiration_time = credential.expiration_time.as_ref().ok_or_else(|| {
+            miette::miette!("gateway returned an extension credential without an expiration time")
+        })?;
+        let expires_at_ms = timestamp_to_millis(expiration_time).into_diagnostic()?;
+        validated.insert(credential.service_name, (credential.token, expires_at_ms));
+    }
+    if validated.len() != expected.len() {
+        return Err(miette::miette!(
+            "gateway omitted one or more requested extension credentials"
+        ));
+    }
+
+    let now_ms = now_ms();
+    for (token, expires_at_ms) in validated.values() {
+        BearerTokenSlot::new(token, *expires_at_ms)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid extension credential")?;
+    }
+
+    // Commit only after the gateway, Sandbox Protocol, and extension
+    // credentials have all been parsed and validated. The remaining updates
+    // repeat those validations but cannot fail for the validated inputs.
+    install_validated_token_slot(gateway_bearer);
+    #[cfg(feature = "jwt")]
+    if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+        match sandbox_slot.update(
+            sandbox_refresh.token,
+            sandbox_refresh.expires_at,
+            sandbox_refresh.credential_epoch,
+        ) {
+            Ok(()) | Err(crate::jwt::SessionJwtError::StaleCredentialEpoch) => {}
+            Err(error) => {
+                return Err(miette::miette!(
+                    "validated Sandbox Protocol credential could not be installed: {error}"
+                ));
+            }
+        }
+    }
+
+    let mut selected = HashMap::with_capacity(validated.len());
+    for (name, (token, expires_at_ms)) in validated {
+        let slot = store
+            .install(&name, &token, expires_at_ms, now_ms)
+            .into_diagnostic()
+            .wrap_err("gateway returned an invalid extension credential")?;
+        selected.insert(name, slot);
+    }
+    Ok(selected)
+}
+
 /// Compute the next refresh delay: 80 % of the time remaining until the
 /// current token's `exp`, plus up to 10 % jitter, with a small lower bound
-/// for already-expired tokens and capped at 12 h. If the token can't be parsed
-/// (legacy/non-JWT bearer) or carries the `exp = 0` non-expiring sentinel,
-/// default to 6 h.
-fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
+/// for already-expired tokens and capped at 12 h. An `exp` of zero denotes a
+/// non-expiring session credential and needs no periodic refresh. If the token
+/// can't be parsed (for example, an opaque bootstrap bearer), default to 6 h.
+fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
     let token = slot
         .read()
         .ok()
         .and_then(|v| v.to_str().ok().map(str::to_string))
         .unwrap_or_default();
-    let bearer = token.strip_prefix("Bearer ").unwrap_or(&token);
     let now_ms = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(i64::MAX);
-    let mut delay_ms = match parse_jwt_exp_ms(bearer) {
-        Some(0) | None => 21_600_000,
-        Some(exp) => {
-            let remaining_ms = exp - now_ms;
-            if remaining_ms <= 0 {
-                1_000
-            } else {
-                (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
-            }
+    let expires_at = parse_jwt_exp_ms(&token);
+    if expires_at == Some(0) {
+        return None;
+    }
+    let mut delay_ms = expires_at.map_or(21_600_000, |exp| {
+        let remaining_ms = exp - now_ms;
+        if remaining_ms <= 0 {
+            1_000
+        } else {
+            (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
         }
-    };
+    });
     // Up to 10 % jitter, derived deterministically from token bytes so
     // unit tests are reproducible without injecting an RNG.
     let jitter_pct = (token.len() % 10) as u64;
     let jitter_ms = (u64::try_from(delay_ms).unwrap_or(0) * jitter_pct) / 100;
     delay_ms = delay_ms.saturating_add(i64::try_from(jitter_ms).unwrap_or(0));
-    Duration::from_millis(u64::try_from(delay_ms).unwrap_or(0))
+    Some(Duration::from_millis(u64::try_from(delay_ms).unwrap_or(0)))
 }
 
 /// Decode the `exp` claim from a JWT without verifying its signature.
@@ -450,6 +716,74 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_rejects_epoch_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_sandbox_refresh(&response).err(),
+            Some(crate::jwt::SessionJwtError::InvalidLifetime)
+        );
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_accepts_missing_expiration_as_non_expiring() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        let refresh = validate_sandbox_refresh(&response).expect("non-expiring refresh");
+        assert_eq!(refresh.expires_at, 0);
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_rejects_malformed_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: -1,
+            }),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_sandbox_refresh(&response).err(),
+            Some(crate::jwt::SessionJwtError::InvalidLifetime)
+        );
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn sandbox_refresh_validation_accepts_canonical_fractional_expiration() {
+        let response = crate::proto::RefreshSandboxTokenResponse {
+            sandbox_token: "sandbox-token".to_string(),
+            sandbox_expiration_time: Some(prost_types::Timestamp {
+                seconds: 1_900_000_000,
+                nanos: 500_000_000,
+            }),
+            credential_epoch: 2,
+            ..Default::default()
+        };
+
+        let refresh = validate_sandbox_refresh(&response).expect("valid refresh");
+        assert_eq!(refresh.expires_at, 1_900_000_000);
+    }
 
     #[test]
     fn parse_jwt_exp_reads_unsigned_payload() {
@@ -482,7 +816,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         // 800 s baseline + up to 10 % jitter → 800..=880 s, with some slack
         // for the 1-second resolution of the exp claim.
         let secs = delay.as_secs();
@@ -503,22 +837,18 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expired token needs refresh");
         assert!((1..60).contains(&delay.as_secs()));
     }
 
     #[test]
-    fn compute_refresh_delay_treats_exp_zero_as_non_expiring() {
+    fn compute_refresh_delay_skips_non_expiring_token() {
         use base64::Engine as _;
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":0}"#);
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
-        assert!(
-            (6 * 60 * 60..=7 * 60 * 60).contains(&delay.as_secs()),
-            "non-expiring tokens should use the fallback refresh delay, got {delay:?}"
-        );
+        assert_eq!(compute_refresh_delay(&slot), None);
     }
 
     #[test]
@@ -534,7 +864,7 @@ mod auth_tests {
         let token = format!("h.{payload}.s");
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
-        let delay = compute_refresh_delay(&slot);
+        let delay = compute_refresh_delay(&slot).expect("expiring token needs refresh");
         assert!(
             delay.as_secs() < 30,
             "expected refresh before 30s expiry, got {delay:?}",
@@ -578,25 +908,22 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     Ok(OpenShellClient::new(channel))
 }
 
-/// Connect to the inference service.
-async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChannel>> {
-    let channel = connect_channel(endpoint).await?;
-    Ok(InferenceClient::new(channel))
-}
-
 /// Fetch sandbox policy from `OpenShell` server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
+pub async fn fetch_policy(
+    endpoint: &str,
+    sandbox_name: &str,
+) -> Result<Option<ProtoSandboxPolicy>> {
+    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to OpenShell server");
 
     let mut client = connect(endpoint).await?;
 
     debug!("Connected, fetching sandbox policy");
 
-    fetch_policy_with_client(&mut client, sandbox_id).await
+    fetch_policy_with_client(&mut client, sandbox_name).await
 }
 
 /// Fetch the authoritative policy and revision metadata in one response.
@@ -605,35 +932,47 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 /// this snapshot instead of re-fetching metadata after policy construction.
 /// The snapshot also carries the external middleware registrations required
 /// by the policy.
+#[tracing::instrument(
+    name = "supervisor.gateway.fetch_settings_snapshot",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
 ) -> Result<SettingsPollResult> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to fetch OpenShell settings snapshot");
+    let status = ClientSpanStatus::current();
+    debug!(endpoint = %endpoint, sandbox_name = %sandbox_name, "Connecting to fetch OpenShell settings snapshot");
     let mut client = connect(endpoint).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox_name, None).await)
 }
 
 async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: Option<&str>,
 ) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            workspace_scope: workspace.map(crate::proto::workspace_selector),
+            name: sandbox_name.to_string(),
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
     Ok(settings_poll_result(response.into_inner()))
+}
+
+fn learned_workspace_selector(workspace: Option<&str>) -> Option<crate::proto::WorkspaceSelector> {
+    workspace.map(crate::proto::workspace_selector)
 }
 
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
-    sandbox_id: &str,
+    sandbox_name: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_id).await?;
+    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_name, None).await?;
 
     // version 0 with no policy means the sandbox was created without one.
     if snapshot.version == 0 && snapshot.policy.is_none() {
@@ -654,13 +993,13 @@ async fn sync_policy_with_client(
 ) -> Result<()> {
     client
         .update_config(UpdateConfigRequest {
-            name: sandbox.to_string(),
+            sandbox: sandbox.to_string(),
+            workspace_scope: Some(crate::proto::workspace_selector(workspace)),
             policy: Some(policy.clone()),
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
-        .into_diagnostic()
+        .map_err(grpc_status_error)
         .wrap_err("failed to sync policy to server")?;
 
     Ok(())
@@ -672,14 +1011,12 @@ async fn sync_policy_with_client(
 /// channel instead of establishing three separate connections.
 pub async fn discover_and_sync_policy(
     endpoint: &str,
-    sandbox_id: &str,
     sandbox: &str,
     discovered_policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<ProtoSandboxPolicy> {
     debug!(
         endpoint = %endpoint,
-        sandbox_id = %sandbox_id,
         sandbox = %sandbox,
         "Syncing discovered policy and re-fetching canonical version"
     );
@@ -690,8 +1027,9 @@ pub async fn discover_and_sync_policy(
     sync_policy_with_client(&mut client, sandbox, discovered_policy, workspace).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_policy_with_client(&mut client, sandbox_id)
+    fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace))
         .await?
+        .policy
         .ok_or_else(|| {
             miette::miette!("Server still returned no policy after sync — this is a bug")
         })
@@ -713,27 +1051,91 @@ pub async fn sync_policy(
 }
 
 /// Sync an enriched policy and return the authoritative revision snapshot.
+#[tracing::instrument(
+    name = "supervisor.gateway.sync_policy_and_fetch_snapshot",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
 pub async fn sync_policy_and_fetch_snapshot(
     endpoint: &str,
-    sandbox_id: &str,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<SettingsPollResult> {
+    let status = ClientSpanStatus::current();
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy, workspace).await?;
-    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+    status.finish(fetch_settings_snapshot_with_client(&mut client, sandbox, Some(workspace)).await)
+}
+
+/// Report an exact runtime configuration generation. Pending registration uses
+/// the snapshot's instance fence; retain that snapshot across registration retries.
+#[tracing::instrument(
+    name = "supervisor.gateway.report_sandbox_configuration",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn report_sandbox_configuration(
+    endpoint: &str,
+    sandbox_id: &str,
+    instance_id: &str,
+    snapshot: Option<&SettingsPollResult>,
+    state: crate::proto::ConfigurationAdmissionState,
+    error: &str,
+) -> Result<()> {
+    let status = ClientSpanStatus::current();
+    let mut client = connect(endpoint).await?;
+    client
+        .report_sandbox_configuration(crate::proto::ReportSandboxConfigurationRequest {
+            sandbox_id: sandbox_id.to_string(),
+            expected_instance_id: snapshot.map_or_else(String::new, |snapshot| {
+                snapshot.configuration_instance_id.clone()
+            }),
+            admission: Some(crate::proto::SandboxConfigurationAdmission {
+                instance_id: instance_id.to_string(),
+                state: state.into(),
+                policy_version: snapshot.map_or(0, |snapshot| snapshot.version),
+                policy_hash: snapshot
+                    .map_or_else(String::new, |snapshot| snapshot.policy_hash.clone()),
+                config_revision: snapshot.map_or(0, |snapshot| snapshot.config_revision),
+                provider_env_revision: snapshot
+                    .map_or(0, |snapshot| snapshot.provider_env_revision),
+                error: error.to_string(),
+            }),
+        })
+        .await
+        .map_err(grpc_status_error)?;
+    status.finish(Ok(()))
 }
 
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
+/// Returns the credential snapshot and its exact readiness identity. An empty
+/// environment represents a sandbox without provider credentials. Transport
+/// failure returns an error so callers can revoke credentials and retry.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
 ) -> Result<ProviderEnvironmentResult> {
+    fetch_provider_environment_with_stable_placeholders(endpoint, sandbox_id, false).await
+}
+
+/// Fetch a snapshot without downgrading previously activated external stable credentials.
+///
+/// Ordinary credentials remain compatible with gateways predating stable delivery.
+/// Callers retain the requirement across refresh failures until an acknowledged
+/// snapshot removes the last external stable credential.
+#[tracing::instrument(
+    name = "supervisor.gateway.fetch_provider_environment",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn fetch_provider_environment_with_stable_placeholders(
+    endpoint: &str,
+    sandbox_id: &str,
+    requires_stable_placeholders: bool,
+) -> Result<ProviderEnvironmentResult> {
+    let status = ClientSpanStatus::current();
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -741,17 +1143,409 @@ pub async fn fetch_provider_environment(
     let response = client
         .get_sandbox_provider_environment(GetSandboxProviderEnvironmentRequest {
             sandbox_id: sandbox_id.to_string(),
+            supports_static_credential_bindings: true,
+            supports_stable_placeholder_environment_keys: true,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(grpc_status_error)?;
 
-    let inner = response.into_inner();
+    status.finish(provider_environment_result(
+        response.into_inner(),
+        requires_stable_placeholders,
+    ))
+}
+
+/// Preserve snapshot authority and reject invalid credential expiration times.
+/// Unknown delivery reasons withhold credentials rather than implying readiness.
+/// A gateway must acknowledge stable delivery until a successful snapshot removes it.
+fn provider_environment_result(
+    inner: GetSandboxProviderEnvironmentResponse,
+    requires_stable_placeholders: bool,
+) -> Result<ProviderEnvironmentResult> {
+    // An empty stable-key list cannot distinguish an acknowledged detach from
+    // an older gateway silently discarding the activated delivery requirement.
+    if !inner.supports_stable_placeholder_environment_keys
+        && (requires_stable_placeholders || !inner.stable_placeholder_environment_keys.is_empty())
+    {
+        miette::bail!("gateway does not support the required stable credential placeholders");
+    }
+    let credential_expires_at_ms = inner
+        .credential_expiration_times
+        .iter()
+        .map(|(name, expiration_time)| {
+            timestamp_to_millis(expiration_time)
+                .map(|value| (name.clone(), value))
+                .into_diagnostic()
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
+        files: inner.files,
         provider_env_revision: inner.provider_env_revision,
-        credential_expires_at_ms: inner.credential_expires_at_ms,
+        provider_attachment_epoch: inner.provider_attachment_epoch,
+        policy_hash: inner.policy_hash,
+        readiness_reason: crate::proto::ProviderReadinessReason::try_from(inner.readiness_reason)
+            .unwrap_or(crate::proto::ProviderReadinessReason::CredentialsWithheld),
+        credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
+        static_credential_bindings: inner.static_credential_bindings,
+        non_secret_environment_keys: inner.non_secret_environment_keys,
+        stable_placeholder_environment_keys: inner.stable_placeholder_environment_keys,
     })
+}
+
+#[cfg(test)]
+mod provider_environment_tests {
+    use super::*;
+    use crate::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use prost::Message;
+
+    #[test]
+    fn stable_placeholder_gateway_ack_preserves_legacy_compatibility() {
+        let response = GetSandboxProviderEnvironmentResponse {
+            environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+            static_credential_bindings: HashMap::from([(
+                "TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider:TOKEN".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        // Legacy wire responses omit field 12. Also test an explicit false value
+        // rather than relying only on a locally constructed default message.
+        let absent = response.encode_to_vec();
+        let mut explicit_false = absent.clone();
+        explicit_false.extend_from_slice(&[0x60, 0x00]);
+        for encoded in [absent, explicit_false] {
+            let decoded = GetSandboxProviderEnvironmentResponse::decode(encoded.as_slice())
+                .expect("provider response wire format");
+            assert!(provider_environment_result(decoded.clone(), false).is_ok());
+            assert!(provider_environment_result(decoded, true).is_err());
+        }
+        assert!(
+            provider_environment_result(GetSandboxProviderEnvironmentResponse::default(), false)
+                .is_ok()
+        );
+        assert!(
+            provider_environment_result(GetSandboxProviderEnvironmentResponse::default(), true)
+                .is_err()
+        );
+
+        let mut declared_stable = response.clone();
+        declared_stable.stable_placeholder_environment_keys = vec!["TOKEN".to_string()];
+        assert!(provider_environment_result(declared_stable, false).is_err());
+
+        // Managed refresh handles predate this external opt-in and do not
+        // require the new capability merely because they use opaque handles.
+        let mut managed_refresh = response;
+        managed_refresh
+            .static_credential_bindings
+            .get_mut("TOKEN")
+            .expect("binding")
+            .workload_credential_handle = "managed-refresh-handle".to_string();
+        assert!(provider_environment_result(managed_refresh, false).is_ok());
+    }
+
+    #[test]
+    fn stable_placeholder_gateway_ack_preserves_environment_metadata() {
+        for stable_keys in [Vec::new(), vec!["TOKEN".to_string()]] {
+            let response = GetSandboxProviderEnvironmentResponse {
+                environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+                provider_env_revision: 42,
+                stable_placeholder_environment_keys: stable_keys.clone(),
+                supports_stable_placeholder_environment_keys: true,
+                ..Default::default()
+            };
+            let result =
+                provider_environment_result(response, true).expect("acknowledged delivery");
+            assert_eq!(result.provider_env_revision, 42);
+            assert_eq!(result.stable_placeholder_environment_keys, stable_keys);
+            assert!(
+                result
+                    .environment
+                    .get("TOKEN")
+                    .is_some_and(|value| value == "synthetic")
+            );
+        }
+    }
+
+    #[test]
+    fn provider_environment_preserves_readiness_identity() {
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                environment: HashMap::from([("TOKEN".to_string(), "synthetic".to_string())]),
+                provider_env_revision: 42,
+                provider_attachment_epoch: "attachment-epoch".to_string(),
+                policy_hash: "binding-policy".to_string(),
+                readiness_reason: crate::proto::ProviderReadinessReason::CredentialsWithheld.into(),
+                credential_expiration_times: HashMap::from([(
+                    "TOKEN".to_string(),
+                    prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: 123_000_000,
+                    },
+                )]),
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("valid provider environment");
+        assert_eq!(result.provider_env_revision, 42);
+        assert_eq!(result.provider_attachment_epoch, "attachment-epoch");
+        assert_eq!(result.policy_hash, "binding-policy");
+        assert_eq!(
+            result.readiness_reason,
+            crate::proto::ProviderReadinessReason::CredentialsWithheld
+        );
+        assert_eq!(
+            result.environment.get("TOKEN").map(String::as_str),
+            Some("synthetic")
+        );
+        assert_eq!(
+            result.credential_expires_at_ms.get("TOKEN"),
+            Some(&1_900_000_000_123)
+        );
+    }
+
+    #[test]
+    fn provider_readiness_unknown_delivery_reason_is_withheld() {
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                policy_hash: "binding-policy".to_string(),
+                readiness_reason: i32::MAX,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("valid provider environment");
+        assert_eq!(
+            result.readiness_reason,
+            crate::proto::ProviderReadinessReason::CredentialsWithheld
+        );
+    }
+
+    #[test]
+    fn provider_environment_rejects_invalid_credential_expiration() {
+        let result = provider_environment_result(
+            GetSandboxProviderEnvironmentResponse {
+                credential_expiration_times: HashMap::from([(
+                    "TOKEN".to_string(),
+                    prost_types::Timestamp {
+                        seconds: 1_900_000_000,
+                        nanos: -1,
+                    },
+                )]),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(result.is_err());
+    }
+}
+
+/// Exchange a provider credential without retaining gateway diagnostics.
+///
+/// Only a verified TLS connection can establish the provenance of a precise
+/// grant classification. Plaintext responses remain safe unknown failures.
+/// A `request_id` travels as `x-request-id` metadata, which the gateway keeps
+/// on its request span and failure log line.
+#[tracing::instrument(
+    name = "supervisor.gateway.exchange_provider_subject_token",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn exchange_provider_subject_token(
+    endpoint: &str,
+    sandbox_id: &str,
+    provider: &str,
+    credential_key: &str,
+    supervisor_jwt_svid: &str,
+    request_id: Option<&str>,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+    let status = ClientSpanStatus::current();
+    let endpoint = token_grant_gateway_endpoint(endpoint)?;
+    if sandbox_id.is_empty() || provider.is_empty() || credential_key.is_empty() {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    if supervisor_jwt_svid.is_empty() {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::WorkloadIdentityRejected,
+            TokenGrantStage::WorkloadIdentity,
+        ));
+    }
+    // TLS setup errors can contain paths and transport errors can contain URLs.
+    // Discard those sources at the grant boundary; never diagnose from prose.
+    // The shared channel bounds the connection attempt; the gateway bounds its
+    // token-service calls, and a gateway deadline arrives as DeadlineExceeded.
+    let mut client = connect(endpoint.as_str())
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?;
+    let request = provider_subject_token_exchange_request(
+        ExchangeProviderSubjectTokenRequest {
+            sandbox_id: sandbox_id.to_string(),
+            provider: provider.to_string(),
+            credential_key: credential_key.to_string(),
+            supervisor_jwt_svid: supervisor_jwt_svid.to_string(),
+        },
+        request_id,
+    );
+    let response = client
+        .exchange_provider_subject_token(request)
+        .await
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?;
+    status.finish(provider_subject_token_exchange_result(
+        response.into_inner(),
+    ))
+}
+
+/// Attach the exchange's request ID as `x-request-id` gRPC metadata.
+///
+/// A value that is not valid metadata is omitted, never rewritten.
+fn provider_subject_token_exchange_request(
+    body: ExchangeProviderSubjectTokenRequest,
+    request_id: Option<&str>,
+) -> tonic::Request<ExchangeProviderSubjectTokenRequest> {
+    let mut request = tonic::Request::new(body);
+    if let Some(request_id) = request_id.and_then(|value| value.parse().ok()) {
+        request.metadata_mut().insert("x-request-id", request_id);
+    }
+    request
+}
+
+fn gateway_grant_failure(kind: TokenGrantFailureKind) -> TokenGrantFailure {
+    TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc)
+}
+
+/// Validate a grant gateway authority before acquiring a workload assertion.
+pub fn token_grant_gateway_endpoint(
+    endpoint: &str,
+) -> std::result::Result<url::Url, TokenGrantFailure> {
+    let endpoint = url::Url::parse(endpoint)
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Configuration))?;
+    // gRPC endpoints identify an authority, not an arbitrary token-service URL.
+    // Reject sensitive URL components before shared connection code can use it.
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.path() != "/"
+    {
+        return Err(gateway_grant_failure(TokenGrantFailureKind::Configuration));
+    }
+    Ok(endpoint)
+}
+
+fn provider_subject_token_exchange_result(
+    inner: crate::proto::ExchangeProviderSubjectTokenResponse,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+    let expires_in = inner
+        .expires_after
+        .as_ref()
+        .map(duration_to_std)
+        .transpose()
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unclassified))?
+        .map_or(0, |value| {
+            i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
+        });
+    Ok(ProviderSubjectTokenExchangeResult {
+        access_token: inner.access_token,
+        expires_in,
+        token_type: inner.token_type,
+    })
+}
+
+fn provider_subject_token_exchange_status(
+    status: &Status,
+    endpoint: &url::Url,
+) -> TokenGrantFailure {
+    // The shared connector verifies the gateway certificate for https
+    // endpoints; only that channel can vouch for a precise classification.
+    if endpoint.scheme() == "https" {
+        TokenGrantFailure::from_status(status)
+    } else {
+        // HTTP provides no authenticated server identity, even when the caller
+        // supplied a valid bearer. Structured details cannot confer that trust.
+        gateway_grant_failure(TokenGrantFailureKind::Unclassified)
+    }
+}
+
+#[cfg(test)]
+mod token_grant_exchange_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_gateway_preserves_typed_failure_and_http_downgrades_it() {
+        let failure = TokenGrantFailure::new(
+            TokenGrantFailureKind::ProviderAuthorizationRequired,
+            TokenGrantStage::IntermediateExchange,
+        );
+        let status = failure.to_status();
+        let endpoint = |value: &str| url::Url::parse(value).unwrap();
+        assert_eq!(
+            provider_subject_token_exchange_status(&status, &endpoint("https://gateway:8080/")),
+            failure
+        );
+        assert_eq!(
+            provider_subject_token_exchange_status(&status, &endpoint("http://gateway:8080/")),
+            gateway_grant_failure(TokenGrantFailureKind::Unclassified)
+        );
+    }
+
+    #[test]
+    fn exchange_request_carries_only_a_valid_request_id() {
+        let request_id = "5c4b3a29-1807-4f6e-8d5c-4b3a29180716";
+        for (value, expected) in [
+            (Some(request_id), Some(request_id)),
+            (Some("line\nbreak"), None),
+            (None, None),
+        ] {
+            let request = provider_subject_token_exchange_request(
+                ExchangeProviderSubjectTokenRequest::default(),
+                value,
+            );
+            let carried = request.metadata().get("x-request-id");
+            assert_eq!(carried.and_then(|value| value.to_str().ok()), expected);
+        }
+    }
+
+    #[test]
+    fn grant_gateway_endpoint_rejects_sensitive_components() {
+        for endpoint in [
+            "https://user:SECRET@localhost/",
+            "https://localhost/?token=SECRET",
+            "https://localhost/SECRET",
+            "file:///SECRET",
+        ] {
+            let failure = token_grant_gateway_endpoint(endpoint).unwrap_err();
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Configuration);
+        }
+        assert!(token_grant_gateway_endpoint("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn gateway_response_keeps_expiration_and_rejects_invalid_duration() {
+        let response = |seconds, nanos| crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: "valid-token".into(),
+            token_type: "Bearer".into(),
+            expires_after: Some(prost_types::Duration { seconds, nanos }),
+        };
+        let result = provider_subject_token_exchange_result(response(120, 0)).unwrap();
+        assert_eq!(result.access_token, "valid-token");
+        assert_eq!(result.expires_in, 120);
+        let failure = provider_subject_token_exchange_result(response(1, -1))
+            .err()
+            .expect("invalid duration is rejected");
+        assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+    }
 }
 
 /// A reusable gRPC client for the `OpenShell` service.
@@ -762,11 +1556,18 @@ pub async fn fetch_provider_environment(
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
     workspace: Arc<tokio::sync::OnceCell<String>>,
+    /// Extension credentials for this supervisor. Cloning the client shares
+    /// the store, so the middleware registry and the polling loop that rotates
+    /// it observe the same slots.
+    extension_credentials: ExtensionCredentialStore,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
 #[derive(Clone, Debug)]
 pub struct SettingsPollResult {
+    pub configuration_instance_id: String,
+    pub configuration_admitted: bool,
+    pub configuration_error: String,
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -777,13 +1578,22 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    /// Attachment identity captured with this effective configuration.
+    pub provider_attachment_epoch: String,
     pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
     /// Workspace the sandbox belongs to.
     pub workspace: String,
+    /// Gateway-configured posture for rejected policy generations.
+    pub policy_validation_failure_mode: crate::PolicyValidationFailureMode,
+    /// Whether the gateway can mint authenticated extension credentials.
+    pub extension_authentication_enabled: bool,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
     SettingsPollResult {
+        configuration_instance_id: inner.configuration_instance_id,
+        configuration_admitted: inner.configuration_admitted,
+        configuration_error: inner.configuration_error,
         policy: inner.policy,
         version: inner.version,
         policy_hash: inner.policy_hash,
@@ -793,25 +1603,125 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         settings: inner.settings,
         global_policy_version: inner.global_policy_version,
         provider_env_revision: inner.provider_env_revision,
+        provider_attachment_epoch: inner.provider_attachment_epoch,
         supervisor_middleware_services: inner.supervisor_middleware_services,
         workspace: inner.workspace,
+        policy_validation_failure_mode: inner
+            .policy_validation_failure_mode
+            .parse()
+            .unwrap_or_default(),
+        extension_authentication_enabled: inner.extension_authentication_enabled,
     }
 }
 
+#[cfg(test)]
+mod settings_poll_tests {
+    use super::{learned_workspace_selector, settings_poll_result};
+    use crate::PolicyValidationFailureMode;
+    use crate::proto::GetSandboxConfigResponse;
+
+    #[test]
+    fn validation_failure_mode_round_trips_from_gateway_config() {
+        let result = settings_poll_result(GetSandboxConfigResponse {
+            policy_validation_failure_mode: "retain_last_valid".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            result.policy_validation_failure_mode,
+            PolicyValidationFailureMode::RetainLastValid
+        );
+    }
+
+    #[test]
+    fn unknown_validation_failure_mode_fails_closed() {
+        let result = settings_poll_result(GetSandboxConfigResponse {
+            policy_validation_failure_mode: "future_mode".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            result.policy_validation_failure_mode,
+            PolicyValidationFailureMode::FailClosed
+        );
+    }
+
+    #[test]
+    fn extension_authentication_capability_round_trips_and_defaults_disabled() {
+        let enabled = settings_poll_result(GetSandboxConfigResponse {
+            extension_authentication_enabled: true,
+            ..Default::default()
+        });
+        assert!(enabled.extension_authentication_enabled);
+
+        let legacy = settings_poll_result(GetSandboxConfigResponse::default());
+        assert!(!legacy.extension_authentication_enabled);
+    }
+
+    #[test]
+    fn workspace_selector_is_omitted_until_bootstrap_learns_the_workspace() {
+        assert!(learned_workspace_selector(None).is_none());
+
+        let selector = learned_workspace_selector(Some("team-a")).expect("workspace selector");
+        assert_eq!(
+            selector.selection,
+            Some(crate::proto::workspace_selector::Selection::Workspace(
+                "team-a".to_string()
+            ))
+        );
+    }
+}
+
+/// Credential material and the authority snapshot that produced its bindings.
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
+    pub files: HashMap<String, String>,
     pub provider_env_revision: u64,
+    /// Attachment identity captured with the delivered credential records.
+    pub provider_attachment_epoch: String,
+    /// Effective policy used to derive the delivered endpoint bindings.
+    pub policy_hash: String,
+    /// Closed failure category; withheld material cannot establish readiness.
+    pub readiness_reason: crate::proto::ProviderReadinessReason,
     pub credential_expires_at_ms: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+    pub static_credential_bindings: HashMap<String, crate::proto::StaticCredentialBinding>,
+    pub non_secret_environment_keys: Vec<String>,
+    /// Credential keys whose stable opaque handles are explicitly authorized
+    /// by the gateway's endpoint bindings.
+    pub stable_placeholder_environment_keys: Vec<String>,
+}
+
+/// Intermediate provider credential returned to the trusted supervisor.
+///
+/// Tokens deliberately have no Debug representation.
+pub struct ProviderSubjectTokenExchangeResult {
+    /// Bearer material for the final token exchange; never log this field.
+    pub access_token: String,
+    /// Remaining lifetime in seconds, or zero when the gateway omitted it.
+    pub expires_in: i64,
+    pub token_type: String,
 }
 
 impl CachedOpenShellClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        Self::connect_with_credentials(endpoint, ExtensionCredentialStore::new()).await
+    }
+
+    /// Connect while sharing an existing credential store.
+    ///
+    /// The supervisor opens the gateway channel more than once (policy load,
+    /// then the polling loop). Both must observe the same slots, otherwise the
+    /// credentials handed to the middleware registry are not the ones the loop
+    /// rotates.
+    pub async fn connect_with_credentials(
+        endpoint: &str,
+        extension_credentials: ExtensionCredentialStore,
+    ) -> Result<Self> {
         debug!(endpoint = %endpoint, "Connecting openshell gRPC client for policy polling");
         let client = connect(endpoint).await?;
         Ok(Self {
             client,
             workspace: Arc::new(tokio::sync::OnceCell::new()),
+            extension_credentials,
         })
     }
 
@@ -821,12 +1731,17 @@ impl CachedOpenShellClient {
     }
 
     /// Poll for current effective sandbox settings and policy metadata.
-    pub async fn poll_settings(&self, sandbox_id: &str) -> Result<SettingsPollResult> {
+    pub async fn poll_settings(&self, sandbox_name: &str) -> Result<SettingsPollResult> {
+        // Sandbox-authenticated callers may omit the selector during bootstrap.
+        // Once the first response identifies the workspace, scope every later
+        // poll explicitly instead of constructing an invalid empty selector.
+        let workspace_scope = learned_workspace_selector(self.workspace.get().map(String::as_str));
         let response = self
             .client
             .clone()
             .get_sandbox_config(GetSandboxConfigRequest {
-                sandbox_id: sandbox_id.to_string(),
+                workspace_scope,
+                name: sandbox_name.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -834,6 +1749,67 @@ impl CachedOpenShellClient {
         let result = settings_poll_result(response.into_inner());
         let _ = self.workspace.set(result.workspace.clone());
         Ok(result)
+    }
+
+    /// The credential store backing this connection's extension clients.
+    #[must_use]
+    pub fn extension_credentials(&self) -> &ExtensionCredentialStore {
+        &self.extension_credentials
+    }
+
+    /// Return the slots for `services`, rotating only when one is missing or
+    /// due.
+    ///
+    /// Configuration polling runs far more often than credentials expire, so
+    /// rotating unconditionally would mint tokens and re-run gateway policy
+    /// authorization roughly ninety times per useful rotation.
+    pub async fn extension_credentials_for(
+        &self,
+        services: &[crate::proto::SupervisorMiddlewareService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let names = authenticated_service_names(services);
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        if !self.extension_credentials.needs_refresh(&names, now_ms())
+            && let Some(slots) = self.extension_credentials.slots_for(&names)
+        {
+            return Ok(slots);
+        }
+        self.refresh_extension_credentials(services).await
+    }
+
+    /// Rotate credentials for `services` unconditionally.
+    pub async fn refresh_extension_credentials(
+        &self,
+        services: &[crate::proto::SupervisorMiddlewareService],
+    ) -> Result<HashMap<String, BearerTokenSlot>> {
+        let mut client = self.client.clone();
+        refresh_extension_credentials_with_client(
+            &mut client,
+            &self.extension_credentials,
+            services,
+        )
+        .await
+    }
+
+    /// Rotate every credential currently retained by the installed registry.
+    /// This remains available when configuration polling fails independently.
+    pub async fn refresh_installed_extension_credentials(&self) -> Result<()> {
+        let names = self.extension_credentials.names();
+        if names.is_empty() || !self.extension_credentials.needs_refresh(&names, now_ms()) {
+            return Ok(());
+        }
+        let services = names
+            .into_iter()
+            .map(|name| crate::proto::SupervisorMiddlewareService {
+                name,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        self.refresh_extension_credentials(&services)
+            .await
+            .map(drop)
     }
 
     /// Returns the workspace learned from the server, or empty if not yet polled.
@@ -870,7 +1846,7 @@ impl CachedOpenShellClient {
                 proposed_chunks,
                 network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
-                workspace: self.workspace(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;
@@ -891,9 +1867,9 @@ impl CachedOpenShellClient {
             .client
             .clone()
             .get_draft_policy(GetDraftPolicyRequest {
-                name: sandbox_name.to_string(),
                 status_filter: status_filter.to_string(),
-                workspace: self.workspace(),
+                sandbox: sandbox_name.to_string(),
+                workspace_scope: Some(crate::proto::workspace_selector(self.workspace())),
             })
             .await
             .into_diagnostic()?;
@@ -927,18 +1903,60 @@ impl CachedOpenShellClient {
 
         Ok(())
     }
-}
 
-/// Fetch the resolved inference route bundle from the server.
-pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
-    debug!(endpoint = %endpoint, "Fetching inference route bundle");
+    /// Report the latest network results for all configured tool endpoints.
+    ///
+    /// The shared snapshot contains only endpoint identifiers, typed results,
+    /// and the endpoints observed in the current batch, so this RPC cannot
+    /// accidentally attach request or credential material to public status.
+    pub async fn report_endpoint_status(
+        &self,
+        sandbox_id: &str,
+        snapshot: &EndpointStatusSnapshot,
+    ) -> Result<()> {
+        let observations = snapshot
+            .endpoints
+            .iter()
+            .map(|endpoint| ProtoEndpointObservation {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                result: match endpoint.result {
+                    EndpointResult::NoObservedExchange => ProtoEndpointResult::NoObservedExchange,
+                    EndpointResult::HttpResponseReceived => {
+                        ProtoEndpointResult::HttpResponseReceived
+                    }
+                    EndpointResult::PolicyDenied => ProtoEndpointResult::PolicyDenied,
+                    EndpointResult::CredentialUnavailable => {
+                        ProtoEndpointResult::CredentialUnavailable
+                    }
+                    EndpointResult::TlsFailed => ProtoEndpointResult::TlsFailed,
+                    EndpointResult::TransportFailed => ProtoEndpointResult::TransportFailed,
+                    EndpointResult::UpstreamRejected => ProtoEndpointResult::UpstreamRejected,
+                }
+                .into(),
+                failure: endpoint
+                    .failure
+                    .as_ref()
+                    .map(crate::endpoint_failure::EndpointFailure::to_proto),
+            })
+            .collect();
 
-    let mut client = connect_inference(endpoint).await?;
+        self.client
+            .clone()
+            .report_endpoint_status(ReportEndpointStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                policy_hash: snapshot.config_version.policy_hash.clone(),
+                provider_env_revision: snapshot.config_version.provider_env_revision,
+                observations,
+                observed_endpoint_ids: snapshot.observed_endpoint_ids.clone(),
+                supervisor_session_id: snapshot.supervisor_session_id.clone(),
+                report_sequence: snapshot.report_sequence,
+                token_grant_status: Some(crate::proto::TokenGrantStatus {
+                    last_failure: snapshot.last_token_grant_failure.clone(),
+                }),
+            })
+            .await
+            .into_diagnostic()?;
 
-    let response = client
-        .get_inference_bundle(GetInferenceBundleRequest {})
-        .await
-        .into_diagnostic()?;
-
-    Ok(response.into_inner())
+        Ok(())
+    }
 }

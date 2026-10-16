@@ -3,10 +3,15 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod legacy_time_wire;
+pub mod lock_order;
+pub mod mutation_lock;
 mod postgres;
+#[cfg(test)]
+mod refresh_lock_tests;
 mod sqlite;
 
-pub use openshell_core::proto::{
+pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
 
@@ -16,6 +21,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
@@ -25,6 +31,12 @@ pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
+
+/// Maximum number of object ids sent in one set-based delete statement.
+///
+/// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
+/// requests into independently retryable, bounded write statements.
+pub const DELETE_MANY_BATCH_SIZE: usize = 128;
 
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
@@ -39,6 +51,8 @@ pub enum PersistenceError {
     Decode(String),
     #[error("encode error: {0}")]
     Encode(String),
+    #[error("pagination error: {0}")]
+    Pagination(String),
     #[error("unique violation{constraint_msg}")]
     UniqueViolation {
         constraint: Option<String>,
@@ -49,9 +63,22 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// The mutation lock was not acquired before its deadline, so this
+    /// request's guarded writes did not run; the operation is safe to retry.
+    #[error("mutation lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 impl PersistenceError {
+    /// Whether this error is a signal the caller acts on rather than a failure.
+    ///
+    /// Both variants are how the store reports contention: `MustCreate` losing
+    /// a race is how [`crate::compute::lease`] learns the lease is held, and a
+    /// version conflict is what drives an optimistic-concurrency retry.
+    pub fn is_expected(&self) -> bool {
+        matches!(self, Self::UniqueViolation { .. } | Self::Conflict { .. })
+    }
+
     pub fn unique_violation(constraint: Option<String>, detail: Option<String>) -> Self {
         let constraint_msg = constraint
             .as_ref()
@@ -92,6 +119,67 @@ pub struct ObjectRecord {
     pub resource_version: u64,
 }
 
+/// Stable position in the global object-listing order.
+///
+/// Keyset consumers must use the matching store method for the total
+/// `(created_at_ms, name, workspace, id)` order encoded here.
+#[derive(Debug, Clone)]
+pub struct ObjectCursor {
+    pub created_at_ms: i64,
+    pub name: String,
+    pub workspace: String,
+    pub id: String,
+}
+
+impl From<&ObjectRecord> for ObjectCursor {
+    fn from(record: &ObjectRecord) -> Self {
+        Self {
+            created_at_ms: record.created_at_ms,
+            name: record.name.clone(),
+            workspace: record.workspace.clone(),
+            id: record.id.clone(),
+        }
+    }
+}
+
+/// Filters supported by the shared object-store keyset pager.
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectListQuery<'a> {
+    Workspace(&'a str),
+    AllWorkspaces,
+    Scope(&'a str),
+    WorkspaceSelector {
+        workspace: &'a str,
+        label_selector: &'a str,
+    },
+    AllWorkspacesSelector(&'a str),
+    Membership {
+        member_type: &'a str,
+        member_name: &'a str,
+    },
+    MembershipSelector {
+        member_type: &'a str,
+        member_name: &'a str,
+        label_selector: &'a str,
+    },
+}
+
+/// One keyset page of raw object records.
+#[derive(Debug)]
+pub struct ObjectPage {
+    pub records: Vec<ObjectRecord>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+/// One keyset page of decoded protobuf messages.
+#[derive(Debug)]
+pub struct MessagePage<T> {
+    pub messages: Vec<T>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+const FULL_SCAN_PAGE_SIZE: u32 = 1000;
+
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -118,13 +206,48 @@ pub enum Store {
     Sqlite(SqliteStore),
 }
 
+/// RAII guard for the database-backed cross-object mutation lock.
+pub struct DistributedMutationGuard {
+    _postgres: Option<postgres::PostgresAdvisoryLockGuard>,
+}
+
+/// RAII guard for the database-backed SSH identity lock.
+pub struct SshIdentityMutationGuard {
+    _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+    _order: lock_order::Held,
+}
+
+pub struct RefreshMutationGuard {
+    _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+}
+
+#[cfg(test)]
+impl DistributedMutationGuard {
+    /// Backend process id of the `PostgreSQL` session holding the locks, or
+    /// `None` on `SQLite`.
+    pub(crate) async fn postgres_backend_pid(&mut self) -> Option<i32> {
+        let Self {
+            _postgres: postgres,
+        } = self;
+        match postgres {
+            Some(guard) => Some(guard.backend_pid().await),
+            None => None,
+        }
+    }
+}
+
 /// Trait for inferring an object type string from a message type.
 pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-// Import object metadata accessor traits from openshell-core
-// (implementations for all proto types are in openshell-core::metadata)
+pub fn migrate_legacy_time_fields(object_type: &str, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
+    legacy_time_wire::migrate(object_type, payload)
+}
+
+// Import object metadata accessor traits from openshell-core. Implementations
+// for public resource types live there; private storage types implement them
+// in crate::storage_proto.
 pub use openshell_core::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
@@ -148,10 +271,11 @@ pub fn generate_name() -> String {
 /// Extracted to avoid repeating the identical decode-and-hydrate block across
 /// `get_message`, `get_message_by_name`, `list_messages`, and
 /// `list_messages_with_selector`.
-fn decode_record<T: Message + Default + SetResourceVersion>(
+fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
-    let mut message = T::decode(record.payload.as_slice())
+    let payload = legacy_time_wire::migrate(T::object_type(), &record.payload)?;
+    let mut message = T::decode(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
     message.set_resource_version(record.resource_version);
     Ok(message)
@@ -171,6 +295,20 @@ macro_rules! store_dispatch {
     };
 }
 
+/// [`store_dispatch`] for methods carrying a span, marking that span failed
+/// unless the error is one the caller is expected to act on.
+macro_rules! store_dispatch_traced {
+    ($self:ident . $method:ident ( $($arg:expr),* )) => {{
+        let result = store_dispatch!($self.$method($($arg),*));
+        if let Err(err) = &result
+            && !err.is_expected()
+        {
+            crate::otel_tracing::mark_error(&tracing::Span::current());
+        }
+        result
+    }};
+}
+
 impl Store {
     /// Returns `true` for single-replica backends (`SQLite`) where no lease
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
@@ -178,10 +316,116 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
-    /// Connect to a persistence store based on the database URL.
+    /// Configured size of the `PostgreSQL` mutation lock pool, or `None` on
+    /// `SQLite`, which has no lock pool.
+    pub fn mutation_lock_connections(&self) -> Option<u32> {
+        match self {
+            Self::Postgres(store) => Some(store.lock_connection_capacity()),
+            Self::Sqlite(_) => None,
+        }
+    }
+
+    /// Serialize mutations whose invariants span multiple persisted objects.
+    ///
+    /// `SQLite` deployments are single-replica and use only the caller's local
+    /// locks. `PostgreSQL` deployments additionally hold `locks` as
+    /// session-level advisory locks, taken in ascending key order on one
+    /// connection from the dedicated lock pool, so concurrent gateway replicas
+    /// cannot validate and write the same cross-object invariant
+    /// independently. Fails with [`PersistenceError::LockTimeout`] when the
+    /// locks are not acquired by `deadline`, and with
+    /// [`PersistenceError::Database`] when `PostgreSQL` does not open a lock
+    /// connection in at least [`mutation_lock::LOCK_CONNECTION_MIN_BUDGET`].
+    pub async fn acquire_distributed_mutation_guard(
+        &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
+    ) -> PersistenceResult<DistributedMutationGuard> {
+        match self {
+            Self::Postgres(store) => Ok(DistributedMutationGuard {
+                _postgres: Some(store.acquire_mutation_locks(locks, deadline).await?),
+            }),
+            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+        }
+    }
+
+    /// Independent of the mutation locks: creation already holds its sandbox
+    /// mutation guard when it provisions a supervisor's durable SSH identity.
+    pub(crate) async fn acquire_ssh_identity_mutation_guard(
+        &self,
+    ) -> PersistenceResult<SshIdentityMutationGuard> {
+        lock_order::check(lock_order::Lock::SshIdentity);
+        match self {
+            Self::Postgres(store) => Ok(SshIdentityMutationGuard {
+                _postgres: Some(
+                    store
+                        .acquire_data_pool_lock(mutation_lock::SSH_IDENTITY_LOCK_KEY)
+                        .await?,
+                ),
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
+            }),
+            Self::Sqlite(_) => Ok(SshIdentityMutationGuard {
+                _postgres: None,
+                _order: lock_order::hold(lock_order::Lock::SshIdentity),
+            }),
+        }
+    }
+
+    /// Independent per-credential lock, shared across `PostgreSQL` replicas.
+    /// Callers also hold a local keyed mutex on `SQLite`.
+    pub(crate) async fn acquire_refresh_guard(
+        &self,
+        provider_id: &str,
+        credential_key: &str,
+    ) -> PersistenceResult<RefreshMutationGuard> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-provider-refresh-lock-v1\0");
+        digest.update(provider_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(credential_key.as_bytes());
+        let hash = digest.finalize();
+        let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
+        match self {
+            Self::Postgres(store) => Ok(RefreshMutationGuard {
+                _postgres: Some(store.acquire_data_pool_lock(key).await?),
+            }),
+            Self::Sqlite(_) => Ok(RefreshMutationGuard { _postgres: None }),
+        }
+    }
+
+    /// Connect to a persistence store based on the database URL, leaving pool
+    /// sizing at the backend default.
     pub async fn connect(url: &str) -> CoreResult<Self> {
+        Self::connect_with_pool_sizes(url, None, None).await
+    }
+
+    /// Connect to a persistence store based on the database URL.
+    ///
+    /// `max_connections` overrides the backend's pool ceiling, which stays at
+    /// its built-in default when `None`. The two backends have different
+    /// defaults, and an in-memory `SQLite` database ignores the override
+    /// entirely — it must be held by exactly one connection.
+    /// `lock_max_connections` sizes the `PostgreSQL` mutation lock pool the
+    /// same way; `SQLite` has no lock pool and ignores it. A `PostgreSQL`
+    /// data pool below 2 is rejected before any connection opens.
+    pub async fn connect_with_pool_sizes(
+        url: &str,
+        max_connections: Option<u32>,
+        lock_max_connections: Option<u32>,
+    ) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            let store = PostgresStore::connect(url)
+            if let Some(configured) = max_connections
+                && configured < postgres::MIN_MAX_CONNECTIONS
+            {
+                return Err(CoreError::config(format!(
+                    "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
+                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
+                     keeps one data connection while it queries the pool",
+                    postgres::MIN_MAX_CONNECTIONS
+                )));
+            }
+            let store = PostgresStore::connect(url, max_connections, lock_max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -190,7 +434,12 @@ impl Store {
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             Ok(Self::Postgres(store))
         } else if url.starts_with("sqlite:") {
-            let store = SqliteStore::connect(url)
+            if lock_max_connections.is_some() {
+                tracing::warn!(
+                    "ignoring the configured mutation lock pool ceiling: SQLite has no lock pool"
+                );
+            }
+            let store = SqliteStore::connect(url, max_connections)
                 .await
                 .map_err(|e| CoreError::execution(e.to_string()))?;
             store
@@ -237,6 +486,12 @@ impl Store {
     /// * `Err(Conflict)` - Resource version mismatch (for `MatchResourceVersion`)
     /// * `Err(UniqueViolation)` - Object already exists (for `MustCreate`) or name conflict
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.put_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
     pub async fn put_if(
         &self,
         object_type: &str,
@@ -247,7 +502,48 @@ impl Store {
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
-        store_dispatch!(self.put_if(object_type, id, name, workspace, payload, labels, condition))
+        store_dispatch_traced!(self.put_if(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            condition
+        ))
+    }
+
+    /// Create an object that is safe to lose in a crash.
+    ///
+    /// Behaves like [`Self::put_if`] with [`WriteCondition::MustCreate`], but
+    /// the file-backed `SQLite` store commits it with `synchronous=NORMAL`, so
+    /// a power loss or kernel crash shortly after the call returns may roll
+    /// the insert back. Use it only for objects whose absence denies access,
+    /// such as newly minted SSH session tokens. Writes that revoke or tighten
+    /// anything must use [`Self::put_if`], which is always durable.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_relaxed", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_relaxed(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels
+        ))
     }
 
     /// Delete an object by id with compare-and-swap support.
@@ -261,17 +557,29 @@ impl Store {
     /// * `Ok(true)` - Object was deleted
     /// * `Ok(false)` - Object not found
     /// * `Err(Conflict)` - Resource version mismatch
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_if", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn delete_if(
         &self,
         object_type: &str,
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete_if(object_type, id, expected_resource_version))
+        store_dispatch_traced!(self.delete_if(object_type, id, expected_resource_version))
     }
 
     /// Insert or update a generic named object with an application-owned scope.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.put_scoped", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
+    )]
     pub async fn put_scoped(
         &self,
         object_type: &str,
@@ -282,67 +590,212 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        store_dispatch!(self.put_scoped(object_type, id, name, workspace, scope, payload, labels))
+        store_dispatch_traced!(self.put_scoped(
+            object_type,
+            id,
+            name,
+            workspace,
+            scope,
+            payload,
+            labels
+        ))
+    }
+
+    /// Atomically insert a generic named object with an application-owned scope.
+    ///
+    /// Unlike [`Self::put_scoped`], this never updates an existing object. A
+    /// duplicate id or `(object_type, workspace, name)` returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_scoped", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, scope = %scope)
+    )]
+    pub async fn create_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        store_dispatch_traced!(self.create_scoped(
+            object_type,
+            id,
+            name,
+            workspace,
+            scope,
+            payload,
+            labels
+        ))
+    }
+
+    /// Atomically insert a named object only if its workspace has fewer than
+    /// `max_count` objects of the same type.
+    ///
+    /// Returns `Ok(None)` when the quota is already full. A duplicate id or
+    /// `(object_type, workspace, name)` still returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
+    )]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_if_workspace_count_below(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            max_count
+        ))
     }
 
     /// Fetch an object by id.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.get", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn get(
         &self,
         object_type: &str,
         id: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        store_dispatch!(self.get(object_type, id))
+        store_dispatch_traced!(self.get(object_type, id))
     }
 
     /// Fetch an object by name within an object type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.get_by_name", otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+            object.name = %name
+        )
+    )]
     pub async fn get_by_name(
         &self,
         object_type: &str,
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        store_dispatch!(self.get_by_name(object_type, workspace, name))
+        store_dispatch_traced!(self.get_by_name(object_type, workspace, name))
     }
 
     /// Delete an object by id.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id)
+    )]
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete(object_type, id))
+        store_dispatch_traced!(self.delete(object_type, id))
+    }
+
+    /// Delete objects of one type by id in bounded, set-based statements.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.delete_many",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(DELETE_MANY_BATCH_SIZE),
+        )
+    )]
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_many(object_type, ids))
     }
 
     /// Count objects of a given type within a workspace.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.count_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn count_in_workspace(
         &self,
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        store_dispatch!(self.count_in_workspace(object_type, workspace))
+        store_dispatch_traced!(self.count_in_workspace(object_type, workspace))
     }
 
     /// Delete all objects of a given type within a workspace.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_all_in_workspace", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn delete_all_in_workspace(
         &self,
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        store_dispatch!(self.delete_all_in_workspace(object_type, workspace))
+        store_dispatch_traced!(self.delete_all_in_workspace(object_type, workspace))
     }
 
     /// Delete all objects of a given type with a matching scope.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
+    )]
     pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
-        store_dispatch!(self.delete_by_scope(object_type, scope))
+        store_dispatch_traced!(self.delete_by_scope(object_type, scope))
     }
 
     /// Delete an object by name within an object type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.delete_by_name", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace, object.name = %name)
+    )]
     pub async fn delete_by_name(
         &self,
         object_type: &str,
         workspace: &str,
         name: &str,
     ) -> PersistenceResult<bool> {
-        store_dispatch!(self.delete_by_name(object_type, workspace, name))
+        store_dispatch_traced!(self.delete_by_name(object_type, workspace, name))
     }
 
     /// List objects by type and workspace.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list", otel.status_code = tracing::field::Empty,  object_type = %object_type, workspace = %workspace)
+    )]
     pub async fn list(
         &self,
         object_type: &str,
@@ -350,23 +803,180 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list(object_type, workspace, limit, offset))
+        store_dispatch_traced!(self.list(object_type, workspace, limit, offset))
     }
 
     /// List objects by type across all workspaces.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_by_type", otel.status_code = tracing::field::Empty,  object_type = %object_type)
+    )]
     pub async fn list_by_type(
         &self,
         object_type: &str,
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_by_type(object_type, limit, offset))
+        store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
+    }
+
+    /// List workspace objects after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.list_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+        )
+    )]
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_after(object_type, workspace, after, limit))
+    }
+
+    /// List objects across workspaces after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.list_by_type_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+        )
+    )]
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_by_type_after(object_type, after, limit))
+    }
+
+    /// Return one keyset page for an explicit query shape.
+    ///
+    /// The page is ordered by the immutable total key
+    /// `(created_at_ms, name, workspace, id)`. `next_cursor` is present only
+    /// when another page exists.
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<ObjectPage> {
+        if page_size == 0 {
+            return Err(PersistenceError::Pagination(
+                "page size must be greater than zero".into(),
+            ));
+        }
+        let fetch_size = page_size.checked_add(1).ok_or_else(|| {
+            PersistenceError::Pagination("page size overflow while probing next page".into())
+        })?;
+        let mut records = match self {
+            Self::Postgres(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+        }?;
+        let has_more = records.len()
+            > usize::try_from(page_size)
+                .map_err(|_| PersistenceError::Pagination("page size does not fit usize".into()))?;
+        if has_more {
+            records.truncate(usize::try_from(page_size).map_err(|_| {
+                PersistenceError::Pagination("page size does not fit usize".into())
+            })?);
+        }
+        let next_cursor = if has_more {
+            records.last().map(ObjectCursor::from)
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    /// Return one decoded keyset page and hydrate every resource version.
+    pub async fn list_message_page<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<MessagePage<T>> {
+        let page = self
+            .list_object_page(T::object_type(), query, after, page_size)
+            .await?;
+        Ok(MessagePage {
+            messages: page
+                .records
+                .into_iter()
+                .map(decode_record)
+                .collect::<PersistenceResult<Vec<T>>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// Exhaust every keyset page and return all matching raw records.
+    pub async fn collect_records(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_object_page(object_type, query, cursor.as_ref(), FULL_SCAN_PAGE_SIZE)
+                .await?;
+            records.extend(page.records);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(records);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    /// Exhaust every keyset page and return all matching decoded messages.
+    ///
+    /// Database and protobuf decode failures abort the operation; no partial
+    /// result is returned.
+    pub async fn collect_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<T>> {
+        let records = self.collect_records(T::object_type(), query).await?;
+        records.into_iter().map(decode_record).collect()
     }
 
     /// List objects by type and application-owned scope.
     ///
     /// Workspace filtering is intentionally omitted: scope values are sandbox
     /// UUIDs which are globally unique. Revisit if non-UUID scopes are introduced.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_by_scope", otel.status_code = tracing::field::Empty,  object_type = %object_type, scope = %scope)
+    )]
     pub async fn list_by_scope(
         &self,
         object_type: &str,
@@ -374,11 +984,22 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_by_scope(object_type, scope, limit, offset))
+        store_dispatch_traced!(self.list_by_scope(object_type, scope, limit, offset))
     }
 
     /// List objects by type and workspace with label selector filtering.
     /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(
+            otel.name = "store.list_with_selector", otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+            label_selector = %label_selector
+        )
+    )]
     pub async fn list_with_selector(
         &self,
         object_type: &str,
@@ -387,7 +1008,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_with_selector(
+        store_dispatch_traced!(self.list_with_selector(
             object_type,
             workspace,
             label_selector,
@@ -396,7 +1017,53 @@ impl Store {
         ))
     }
 
+    /// List objects of `object_type` that have a related `member_type` record
+    /// whose `name` column matches `member_name` in the same workspace.
+    pub async fn list_with_membership(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_membership(
+            object_type,
+            member_type,
+            member_name,
+            limit,
+            offset
+        ))
+    }
+
+    /// List objects of `object_type` that have a related `member_type` record
+    /// whose `name` column matches `member_name`, with label selector filtering.
+    pub async fn list_with_membership_and_selector(
+        &self,
+        object_type: &str,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch!(self.list_with_membership_and_selector(
+            object_type,
+            member_type,
+            member_name,
+            label_selector,
+            limit,
+            offset
+        ))
+    }
+
     /// List objects by type across all workspaces with label selector filtering.
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.list_all_with_selector", otel.status_code = tracing::field::Empty,  object_type = %object_type, label_selector = %label_selector)
+    )]
     pub async fn list_all_with_selector(
         &self,
         object_type: &str,
@@ -404,7 +1071,12 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_all_with_selector(object_type, label_selector, limit, offset))
+        store_dispatch_traced!(self.list_all_with_selector(
+            object_type,
+            label_selector,
+            limit,
+            offset
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -484,18 +1156,48 @@ impl Store {
             .collect()
     }
 
-    /// List and decode protobuf messages across all workspaces, hydrating
-    /// `resource_version` from the authoritative DB row.
-    pub async fn list_all_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+    /// List and decode objects that have a related membership record, with
+    /// pagination. See [`Store::list_with_membership`] for details.
+    pub async fn list_messages_with_membership<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
         &self,
+        member_type: &str,
+        member_name: &str,
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<T>> {
-        self.list_by_type(T::object_type(), limit, offset)
+        self.list_with_membership(T::object_type(), member_type, member_name, limit, offset)
             .await?
             .into_iter()
             .map(decode_record)
             .collect()
+    }
+
+    /// List and decode objects that have a related membership record, with
+    /// label selector filtering and pagination.
+    pub async fn list_messages_with_membership_and_selector<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        member_type: &str,
+        member_name: &str,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        self.list_with_membership_and_selector(
+            T::object_type(),
+            member_type,
+            member_name,
+            label_selector,
+            limit,
+            offset,
+        )
+        .await?
+        .into_iter()
+        .map(decode_record)
+        .collect()
     }
 
     /// List and decode protobuf messages across all workspaces with label
@@ -537,7 +1239,7 @@ impl Store {
     /// Update a protobuf message using CAS (compare-and-swap).
     ///
     /// Fetches the current object, validates the expected version, applies the
-    /// mutation function, and attempts a single CAS write. Returns Conflict on
+    /// mutation function, and attempts a CAS write. Returns Conflict on
     /// version mismatch for caller-driven retry.
     ///
     /// # Arguments
@@ -570,79 +1272,92 @@ impl Store {
             + Clone,
         F: FnMut(&mut T),
     {
-        // Fetch current object with authoritative resource_version
-        let current = self
-            .get_message::<T>(id)
-            .await?
-            .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
+        const INTERNAL_CAS_ATTEMPTS: u32 = 5;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            // Fetch current object with authoritative resource_version
+            let current = self
+                .get_message::<T>(id)
+                .await?
+                .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
 
-        let current_version = current.get_resource_version();
+            let current_version = current.get_resource_version();
 
-        // Determine the version to use for CAS:
-        // - If expected_version is 0, use current version (internal operations)
-        // - Otherwise, validate that expected matches current (client-facing operations)
-        let cas_version = if expected_version == 0 {
-            current_version
-        } else {
-            if expected_version != current_version {
-                return Err(PersistenceError::Conflict {
-                    current_resource_version: Some(current_version),
-                });
+            // Determine the version to use for CAS:
+            // - If expected_version is 0, use current version (internal operations)
+            // - Otherwise, validate that expected matches current (client-facing operations)
+            let cas_version = if expected_version == 0 {
+                current_version
+            } else {
+                if expected_version != current_version {
+                    return Err(PersistenceError::Conflict {
+                        current_resource_version: Some(current_version),
+                    });
+                }
+                expected_version
+            };
+
+            // Apply mutation
+            let mut updated = current.clone();
+            mutate(&mut updated);
+
+            // Serialize labels
+            let labels_map = updated.object_labels();
+            let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+                None
+            } else {
+                Some(serde_json::to_string(&labels_map).map_err(|e| {
+                    PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+                })?)
+            };
+
+            if T::requires_workspace() && updated.object_workspace().is_empty() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} requires a non-empty workspace",
+                    T::object_type(),
+                )));
             }
-            expected_version
-        };
 
-        // Apply mutation
-        let mut updated = current.clone();
-        mutate(&mut updated);
+            if updated.object_name() != current.object_name() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} name cannot be changed after creation",
+                    T::object_type(),
+                )));
+            }
 
-        // Serialize labels
-        let labels_map = updated.object_labels();
-        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-            None
-        } else {
-            Some(serde_json::to_string(&labels_map).map_err(|e| {
-                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
-            })?)
-        };
+            if updated.object_workspace() != current.object_workspace() {
+                return Err(PersistenceError::Encode(format!(
+                    "{} workspace cannot be changed after creation",
+                    T::object_type(),
+                )));
+            }
 
-        if T::requires_workspace() && updated.object_workspace().is_empty() {
-            return Err(PersistenceError::Encode(format!(
-                "{} requires a non-empty workspace",
-                T::object_type(),
-            )));
+            let result = match self
+                .put_if(
+                    T::object_type(),
+                    updated.object_id(),
+                    updated.object_name(),
+                    updated.object_workspace(),
+                    &updated.encode_to_vec(),
+                    labels_json.as_deref(),
+                    WriteCondition::MatchResourceVersion(cas_version),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(PersistenceError::Conflict { .. })
+                    if expected_version == 0 && attempt < INTERNAL_CAS_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+            // Success - hydrate the new resource_version and return
+            updated.set_resource_version(result.resource_version);
+            return Ok(updated);
         }
-
-        if updated.object_name() != current.object_name() {
-            return Err(PersistenceError::Encode(format!(
-                "{} name cannot be changed after creation",
-                T::object_type(),
-            )));
-        }
-
-        if updated.object_workspace() != current.object_workspace() {
-            return Err(PersistenceError::Encode(format!(
-                "{} workspace cannot be changed after creation",
-                T::object_type(),
-            )));
-        }
-
-        // Single-attempt CAS write - fails with Conflict on version mismatch
-        let result = self
-            .put_if(
-                T::object_type(),
-                updated.object_id(),
-                updated.object_name(),
-                updated.object_workspace(),
-                &updated.encode_to_vec(),
-                labels_json.as_deref(),
-                WriteCondition::MatchResourceVersion(cas_version),
-            )
-            .await?;
-
-        // Success - hydrate the new resource_version and return
-        updated.set_resource_version(result.resource_version);
-        Ok(updated)
     }
 }
 
@@ -728,6 +1443,12 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
 /// [`Store::update_message_cas`] to ensure every write is CAS-protected.
 #[cfg(test)]
 impl Store {
+    #[tracing::instrument(
+        name = "store",
+        level = "debug",
+        skip_all,
+        fields(otel.name = "store.put", otel.status_code = tracing::field::Empty,  object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace)
+    )]
     pub async fn put(
         &self,
         object_type: &str,
@@ -737,7 +1458,7 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        store_dispatch!(self.put(object_type, id, name, workspace, payload, labels))
+        store_dispatch_traced!(self.put(object_type, id, name, workspace, payload, labels))
     }
 
     pub async fn put_message<
@@ -773,11 +1494,28 @@ impl Store {
 }
 
 #[cfg(test)]
+impl Store {
+    /// Closes the backing connection pool.
+    pub(crate) async fn close_for_test(&self) {
+        match self {
+            Self::Sqlite(store) => store.close_for_test().await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
+    }
+}
+
+#[cfg(test)]
 pub async fn test_store() -> Store {
     Store::connect("sqlite::memory:?cache=shared")
         .await
         .expect("in-memory SQLite store should connect")
 }
+
+#[cfg(test)]
+pub mod test_postgres;
+
+#[cfg(test)]
+mod mutation_lock_pg_tests;
 
 #[cfg(test)]
 mod tests;

@@ -3,7 +3,7 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::proto::inference_client::InferenceClient;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
     RootCertStore,
@@ -18,14 +18,14 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
+use url::{Host, Url};
 
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
-/// Concrete inference client type.
-pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -222,12 +222,33 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
         .into_diagnostic()
 }
 
-pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
+pub fn build_tonic_tls_config(server: &str, materials: &TlsMaterials) -> Result<ClientTlsConfig> {
     let ca_cert = Certificate::from_pem(materials.ca.clone());
     let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
-    ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .identity(identity)
+    tls_config_with_server_name(
+        server,
+        ClientTlsConfig::new()
+            .ca_certificate(ca_cert)
+            .identity(identity),
+    )
+}
+
+fn tls_config_with_server_name(server: &str, config: ClientTlsConfig) -> Result<ClientTlsConfig> {
+    Ok(config.domain_name(tls_server_name(server)?))
+}
+
+fn tls_server_name(server: &str) -> Result<String> {
+    let endpoint = Url::parse(server)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid gateway endpoint '{server}'"))?;
+    let host = endpoint
+        .host()
+        .ok_or_else(|| miette::miette!("gateway endpoint '{server}' has no host"))?;
+    Ok(match host {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -264,7 +285,7 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -295,6 +316,7 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
             let port = uri.port_u16().unwrap_or(443);
             let addr = format!("{host}:{port}");
             let tcp = tokio::net::TcpStream::connect(addr).await?;
+            set_tcp_nodelay_best_effort(&tcp);
             let server_name = ServerName::try_from(host)?;
             let tls_stream = tls_connector.connect(server_name, tcp).await?;
             Ok(hyper_util::rt::TokioIo::new(tls_stream))
@@ -400,22 +422,20 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         // Bearer auth over HTTPS: use mTLS certs for the transport layer when
         // available (server may still require client certs), and layer the
         // Bearer token on top via the interceptor.
-        require_tls_materials(server, tls).map_or_else(
-            |_| {
-                let resolved = tls.with_default_paths(server);
-                resolved
-                    .ca
-                    .as_ref()
-                    .and_then(|ca_path| std::fs::read(ca_path).ok())
-                    .map_or_else(
-                        || ClientTlsConfig::new().with_enabled_roots(),
-                        |ca_pem| {
-                            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                        },
-                    )
-            },
-            |materials| build_tonic_tls_config(&materials),
-        )
+        if let Ok(materials) = require_tls_materials(server, tls) {
+            build_tonic_tls_config(server, &materials)?
+        } else {
+            let resolved = tls.with_default_paths(server);
+            let config = resolved
+                .ca
+                .as_ref()
+                .and_then(|ca_path| std::fs::read(ca_path).ok())
+                .map_or_else(
+                    || ClientTlsConfig::new().with_enabled_roots(),
+                    |ca_pem| ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem)),
+                );
+            tls_config_with_server_name(server, config)?
+        }
     } else if tls.edge_token.is_some() {
         // Edge bearer mode — routed through tunnel above; if we reach here
         // the server is not HTTPS so connect plaintext.
@@ -423,7 +443,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     } else {
         // Standard mTLS: private CA + client cert.
         let materials = require_tls_materials(server, tls)?;
-        build_tonic_tls_config(&materials)
+        build_tonic_tls_config(server, &materials)?
     };
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     endpoint.connect().await.into_diagnostic()
@@ -444,8 +464,142 @@ fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
     EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
 }
 
-pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
-    Ok(InferenceClient::with_interceptor(channel, interceptor))
+/// Gateway replica that owns the sandbox named in `response`, when it says.
+pub fn owner_replica<T>(response: &tonic::Response<T>) -> Option<AsciiMetadataValue> {
+    response
+        .metadata()
+        .get(openshell_core::replica_routing::OWNER_REPLICA_HEADER)
+        .cloned()
+}
+
+pub fn with_owner_hint<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        openshell_core::replica_routing::OWNER_REQUEST_HEADER,
+        AsciiMetadataValue::from_static("1"),
+    );
+    request
+}
+
+/// Wrap `message` so the edge proxy can route it straight to `replica`.
+pub fn routed_to<T>(message: T, replica: Option<&AsciiMetadataValue>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if let Some(replica) = replica {
+        request.metadata_mut().insert(
+            openshell_core::replica_routing::ROUTE_REPLICA_HEADER,
+            replica.clone(),
+        );
+    }
+    request
+}
+
+/// A routed call is retried once without routing only when no gateway
+/// received it.
+///
+/// Envoy Gateway answers a replica route whose Service has no ready endpoints
+/// with `grpc-status: 14` and no `grpc-message`, while gateway errors and
+/// mid-request resets always carry a message.
+pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Status) -> bool {
+    let message = status.message();
+    replica.is_some()
+        && status.code() == tonic::Code::Unavailable
+        && (message.is_empty()
+            || message.contains("no healthy upstream")
+            || message.contains("connection failure"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{owner_replica, retry_unrouted, routed_to, tls_server_name, with_owner_hint};
+    use openshell_core::replica_routing::{
+        OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, ROUTE_REPLICA_HEADER,
+    };
+
+    #[test]
+    fn owner_hint_is_requested_explicitly() {
+        assert!(
+            with_owner_hint(())
+                .metadata()
+                .contains_key(OWNER_REQUEST_HEADER)
+        );
+    }
+
+    #[test]
+    fn owner_replica_is_carried_to_the_routed_request() {
+        let mut response = tonic::Response::new(());
+        response
+            .metadata_mut()
+            .insert(OWNER_REPLICA_HEADER, "openshell-1".parse().unwrap());
+        let replica = owner_replica(&response);
+        let request = routed_to((), replica.as_ref());
+        assert_eq!(
+            request.metadata().get(ROUTE_REPLICA_HEADER).unwrap(),
+            "openshell-1"
+        );
+    }
+
+    #[test]
+    fn requests_without_a_known_owner_are_not_routed() {
+        let replica = owner_replica(&tonic::Response::new(()));
+        assert!(replica.is_none());
+        let request = routed_to((), replica.as_ref());
+        assert!(request.metadata().get(ROUTE_REPLICA_HEADER).is_none());
+    }
+
+    #[test]
+    fn only_unavailable_routed_calls_are_retried() {
+        let replica = "openshell-1".parse().unwrap();
+        let unavailable = tonic::Status::unavailable("no healthy upstream");
+        assert!(retry_unrouted(Some(&replica), &unavailable));
+        assert!(!retry_unrouted(None, &unavailable));
+        assert!(!retry_unrouted(
+            Some(&replica),
+            &tonic::Status::permission_denied("denied")
+        ));
+    }
+
+    #[test]
+    fn calls_are_retried_only_when_no_gateway_received_them() {
+        let replica = "openshell-1".parse().unwrap();
+        for never_arrived in [
+            "",
+            "no healthy upstream",
+            "upstream connect error or disconnect/reset before headers. reset reason: connection failure, transport failure reason: delayed connect error: Connection refused",
+        ] {
+            assert!(retry_unrouted(
+                Some(&replica),
+                &tonic::Status::unavailable(never_arrived)
+            ));
+        }
+        for may_have_started in [
+            "supervisor session not connected",
+            "upstream connect error or disconnect/reset before headers. reset reason: connection termination",
+        ] {
+            assert!(!retry_unrouted(
+                Some(&replica),
+                &tonic::Status::unavailable(may_have_started)
+            ));
+        }
+        assert!(!retry_unrouted(
+            None,
+            &tonic::Status::unavailable("no healthy upstream")
+        ));
+    }
+
+    #[test]
+    fn tls_server_name_normalizes_bracketed_ipv6_endpoint() {
+        assert_eq!(
+            tls_server_name("https://[::1]:17670").unwrap(),
+            "::1",
+            "rustls accepts an unbracketed IPv6 address as an IP server name"
+        );
+    }
+
+    #[test]
+    fn tls_server_name_preserves_dns_endpoint() {
+        assert_eq!(
+            tls_server_name("https://localhost:17670").unwrap(),
+            "localhost"
+        );
+    }
 }

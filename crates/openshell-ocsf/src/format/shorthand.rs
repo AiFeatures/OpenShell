@@ -134,12 +134,24 @@ fn reason_tag(base: &BaseEventData) -> String {
         .map_or_else(String::new, |text| format!(" [reason:{text}]"))
 }
 
-fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
-    base.unmapped
+fn sorted_unmapped_fields(base: &BaseEventData) -> Vec<(&str, &serde_json::Value)> {
+    let mut fields: Vec<_> = base
+        .unmapped
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    // Cargo can enable insertion-ordered JSON maps through another dependency.
+    // Keep shorthand ordering and truncated field selection stable either way.
+    fields.sort_unstable_by_key(|(key, _)| *key);
+    fields
+}
+
+fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
+    sorted_unmapped_fields(base)
+        .into_iter()
         .filter_map(|(key, value)| {
             let value = match value {
                 serde_json::Value::Bool(value) => value.to_string(),
@@ -240,12 +252,20 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                let message_ctx =
-                    if detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty() {
-                        message_tag(&e.base)
-                    } else {
-                        String::new()
-                    };
+                // Most network messages duplicate the structured action and
+                // destination shown above. Transparent TCP correlation is the
+                // exception: its message intentionally carries the logical,
+                // synthetic, and actual dial targets needed to follow the
+                // policy-DNS mapping in the human-readable audit log.
+                let show_correlation_message =
+                    e.base.status_detail.as_deref() == Some("transparent_tcp_allowed");
+                let message_ctx = if show_correlation_message
+                    || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty())
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 
@@ -297,6 +317,50 @@ impl OcsfEvent {
                     String::new()
                 };
                 format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
+            }
+
+            Self::ApiActivity(e) => {
+                let model_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " {}",
+                            escape_context_field(&truncate_with_ellipsis(&m.name, MAX_REASON_LEN))
+                        )
+                    })
+                    .unwrap_or_default();
+                let provider_ctx = e
+                    .base
+                    .ai_model
+                    .as_ref()
+                    .map(|m| {
+                        format!(
+                            " via {}",
+                            escape_context_field(&truncate_with_ellipsis(
+                                &m.ai_provider,
+                                MAX_REASON_LEN
+                            ))
+                        )
+                    })
+                    .unwrap_or_default();
+                let latency = e
+                    .base
+                    .unmapped
+                    .as_ref()
+                    .and_then(|u| u.get("latency_ms"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|ms| format!(" {ms}ms"))
+                    .unwrap_or_default();
+                let op =
+                    escape_context_field(&truncate_with_ellipsis(&e.api.operation, MAX_REASON_LEN));
+                let status_ctx = e
+                    .base
+                    .status
+                    .map(|s| format!(" {}", s.label()))
+                    .unwrap_or_default();
+                format!("API:INFERENCE {sev}{status_ctx}{model_ctx}{provider_ctx}{latency} [{op}]")
             }
 
             Self::SshActivity(e) => {
@@ -405,7 +469,8 @@ impl OcsfEvent {
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
                 // emits `auto`/`source`/`prover_delta`; every config change
-                // also carries `policy_version` and `policy_hash`. Order is
+                // also carries `policy_version` and `policy_hash`. Rejections
+                // add `chunk_id`, `rejection_reason`, and `actor`. Order is
                 // stable so logs are greppable.
                 let suffix = e
                     .base
@@ -415,18 +480,21 @@ impl OcsfEvent {
                         let mut parts: Vec<String> = Vec::new();
                         let mut push = |key: &str| {
                             if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
-                                parts.push(format!("{key}:{value}"));
+                                parts.push(format!("{key}:{}", escape_context_field(value)));
                             }
                         };
                         push("auto");
                         push("source");
                         push("prover_delta");
                         push("resolved_from");
+                        push("chunk_id");
+                        push("rejection_reason");
+                        push("actor");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
-                            parts.push(format!("version:{ver}"));
+                            parts.push(format!("version:{}", escape_context_field(ver)));
                         }
                         if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
-                            parts.push(format!("hash:{hash}"));
+                            parts.push(format!("hash:{}", escape_context_field(hash)));
                         }
                         if parts.is_empty() {
                             String::new()
@@ -450,9 +518,9 @@ impl OcsfEvent {
                         if obj.is_empty() {
                             return None;
                         }
-                        let fields: Vec<String> = obj
-                            .iter()
-                            .take(3) // Limit to 3 most important fields
+                        let fields: Vec<String> = sorted_unmapped_fields(&e.base)
+                            .into_iter()
+                            .take(3)
                             .map(|(k, v)| {
                                 let val = v.as_str().map_or_else(|| v.to_string(), String::from);
                                 format!("{k}:{val}")
@@ -481,7 +549,7 @@ mod tests {
 
     fn test_metadata() -> Metadata {
         Metadata {
-            version: "1.7.0".to_string(),
+            version: "1.8.0".to_string(),
             product: Product::openshell_sandbox("0.1.0"),
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),
@@ -624,8 +692,8 @@ mod tests {
     #[test]
     fn test_http_activity_shorthand_includes_unmapped_attributes() {
         let mut base = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
-        base.add_unmapped("attempt", serde_json::json!(2));
         base.add_unmapped("cached", serde_json::json!(true));
+        base.add_unmapped("attempt", serde_json::json!(2));
         let event = OcsfEvent::HttpActivity(HttpActivityEvent {
             base,
             http_request: Some(HttpRequest::new(
@@ -1180,6 +1248,32 @@ mod tests {
         );
     }
 
+    /// Rejection audit events carry the chunk, reason, and deciding actor.
+    /// Reviewer-typed text must not be able to close the bracketed suffix.
+    #[test]
+    fn test_config_state_change_shorthand_includes_rejection_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("gateway rejected draft chunk chunk-1");
+        b.add_unmapped("chunk_id", serde_json::json!("chunk-1"));
+        b.add_unmapped("rejection_reason", serde_json::json!("too broad] [x"));
+        b.add_unmapped("actor", serde_json::json!("user:reviewer"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("REJECTED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "CONFIG:REJECTED [INFO] gateway rejected draft chunk chunk-1 \
+             [chunk_id:chunk-1 rejection_reason:too\\u{20}broad\\]\\u{20}\\[x \
+             actor:user:reviewer]"
+        );
+    }
+
     #[test]
     fn test_base_event_shorthand() {
         let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
@@ -1192,6 +1286,21 @@ mod tests {
         assert_eq!(
             shorthand,
             "EVENT [INFO] Network namespace created [ns:openshell-sandbox-abc123]"
+        );
+    }
+
+    #[test]
+    fn test_base_event_selects_unmapped_fields_in_key_order() {
+        let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+        b.set_message("Context");
+        for (key, value) in [("z", 4), ("c", 3), ("a", 1), ("b", 2)] {
+            b.add_unmapped(key, serde_json::json!(value));
+        }
+
+        let event = OcsfEvent::Base(BaseEvent { base: b });
+        assert_eq!(
+            event.format_shorthand(),
+            "EVENT [INFO] Context [a:1 b:2 c:3]"
         );
     }
 }
