@@ -3,6 +3,7 @@
 
 //! Shared helpers, types, and parsing utilities used across CLI command groups.
 
+use crate::color::Colorize;
 use chrono::DateTime;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -16,11 +17,13 @@ use openshell_core::proto::{
     PlatformEvent, SandboxPhase, SandboxPolicy, SettingValue, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
-use owo_colors::OwoColorize;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+const DOCS_PROVIDERS_URL: &str =
+    "https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview";
 
 // ---------------------------------------------------------------------------
 // View types
@@ -59,6 +62,10 @@ pub fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Ready) => "Ready",
         Ok(SandboxPhase::Error) => "Error",
         Ok(SandboxPhase::Deleting) => "Deleting",
+        Ok(SandboxPhase::Stopping) => "Stopping",
+        Ok(SandboxPhase::Stopped) => "Stopped",
+        Ok(SandboxPhase::Starting) => "Starting",
+        Ok(SandboxPhase::Completed) => "Completed",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
 }
@@ -440,7 +447,7 @@ pub fn noninteractive_active_label(step: ProvisioningStep) -> String {
 
 pub fn handle_platform_progress_event(
     event: &PlatformEvent,
-    display: &mut Option<ProvisioningDisplay>,
+    mut display: Option<&mut ProvisioningDisplay>,
     provision_start: Instant,
 ) -> bool {
     let completed_step = event
@@ -466,7 +473,7 @@ pub fn handle_platform_progress_event(
             .metadata
             .get(PROGRESS_COMPLETE_LABEL_KEY)
             .map_or_else(|| step.completed_label(), String::as_str);
-        if let Some(d) = display.as_mut() {
+        if let Some(d) = display.as_deref_mut() {
             d.complete_step_with_label(step, label);
         } else {
             let ts = format_timestamp(provision_start.elapsed());
@@ -475,13 +482,13 @@ pub fn handle_platform_progress_event(
     }
 
     if let Some(step) = active_step
-        && let Some(d) = display.as_mut()
+        && let Some(d) = display.as_deref_mut()
     {
         d.set_active_step(step);
     }
 
     if let Some(detail) = active_detail {
-        if let Some(d) = display.as_mut() {
+        if let Some(d) = display {
             d.set_active_detail(detail);
         } else {
             let ts = format_timestamp(provision_start.elapsed());
@@ -719,7 +726,10 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
     if s.is_empty() {
         return Err(miette::miette!("empty duration string"));
     }
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    // Split off the last character by its UTF-8 length: indexing by byte
+    // length would panic on multi-byte units (e.g. "5\u{20ac}").
+    let last_len = s.chars().last().map_or(0, char::len_utf8);
+    let (num_str, unit) = s.split_at(s.len() - last_len);
     let num: i64 = num_str
         .parse()
         .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
@@ -733,12 +743,117 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    Ok(num * multiplier)
+    num.checked_mul(multiplier).ok_or_else(|| {
+        miette::miette!("duration out of range: {s} (must fit in milliseconds as a 64-bit integer)")
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Parsing utilities
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSuggestion {
+    pub provider_type: String,
+    pub credential: String,
+}
+
+fn credential_env_matches(
+    env: &HashMap<String, String>,
+    profiles: &[openshell_providers::ProviderTypeProfile],
+) -> Vec<(String, Vec<ProfileSuggestion>)> {
+    const KEYWORDS: [&str; 7_usize] = [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "ACCESS_KEY",
+        "SECRET_KEY",
+        "API_KEY",
+    ];
+    let looks_like_credential = |key: &str| -> bool {
+        let upper = key.to_ascii_uppercase();
+        let segs = upper.split('_').collect::<Vec<&str>>();
+        KEYWORDS.iter().any(|kw| {
+            let words = kw.split('_').collect::<Vec<&str>>();
+            segs.windows(words.len()).any(|w| w == words.as_slice())
+        })
+    };
+
+    // Suggestions come from the connected gateway's catalog, so they only ever
+    // name a profile the user can actually create a provider from.
+    let profile_suggestions = |key: &str| -> Vec<ProfileSuggestion> {
+        let mut suggestions = Vec::new();
+        for profile in profiles {
+            for cred in &profile.credentials {
+                if cred.env_vars.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+                    suggestions.push(ProfileSuggestion {
+                        provider_type: profile.id.clone(),
+                        credential: cred.name.clone(),
+                    });
+                }
+            }
+        }
+        suggestions
+    };
+
+    let mut matches = Vec::new();
+
+    for key in env.keys() {
+        let sug = profile_suggestions(key);
+        if !sug.is_empty() || looks_like_credential(key) {
+            matches.push((key.clone(), sug));
+        }
+    }
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches
+}
+
+/// Warn about credentials passed as plain `--env` values.
+///
+/// `profiles` is the connected gateway's catalog. Pass an empty slice when it
+/// could not be fetched: the warning still fires, it just cannot name a profile
+/// to use instead.
+#[allow(clippy::implicit_hasher)]
+pub fn warn_credential_env_vars(
+    env: &HashMap<String, String>,
+    profiles: &[openshell_providers::ProviderTypeProfile],
+    suppress: bool,
+) {
+    if suppress {
+        return;
+    }
+
+    let matches = credential_env_matches(env, profiles);
+    if matches.is_empty() {
+        return;
+    }
+
+    for (key, suggestions) in &matches {
+        eprintln!(
+            "{} {key} looks like a credential passed as a plain environment variable.",
+            "⚠".yellow()
+        );
+        eprintln!("  The agent inside the sandbox can read this value directly.");
+        eprintln!();
+
+        if suggestions.is_empty() {
+            eprintln!("  To hide it from the agent, use a provider instead of --env.");
+        } else {
+            eprintln!("  To hide it from the agent, use a provider instead:");
+            for s in suggestions {
+                eprintln!(
+                    "    openshell provider create --name my-{ty} --type {ty} --credential {key}",
+                    ty = s.provider_type
+                );
+            }
+            eprintln!("    openshell sandbox create --provider my-<name> ...");
+        }
+        eprintln!("  See: {DOCS_PROVIDERS_URL}");
+        eprintln!();
+    }
+}
 
 pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
@@ -773,6 +888,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
             ));
         }
     }
+    Ok(map)
+}
+
+/// Resolve `--env-from KEY[=ENVVAR]` values from the CLI process environment.
+///
+/// This keeps environment values out of process arguments while preserving the
+/// same sandbox environment validation as `--env KEY=VALUE`.
+pub fn parse_env_from_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env-from key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env-from keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+        if !is_valid_env_name(env_name) {
+            return Err(miette::miette!(
+                "--env-from source must match [A-Za-z_][A-Za-z0-9_]*; got '{env_name}'"
+            ));
+        }
+        if map.contains_key(key) {
+            return Err(miette::miette!("duplicate --env-from sandbox key '{key}'"));
+        }
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--env-from source environment variable '{env_name}' is not set or is not valid Unicode"
+            )
+        })?;
+        map.insert(key.to_string(), value);
+    }
+
     Ok(map)
 }
 
@@ -947,4 +1103,210 @@ pub fn scrub_git_env(command: &mut Command) -> &mut Command {
         command.env_remove(key);
     }
     command
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_to_ms_parses_supported_units() {
+        assert_eq!(parse_duration_to_ms("30s").expect("parse"), 30_000);
+        assert_eq!(parse_duration_to_ms("5m").expect("parse"), 300_000);
+        assert_eq!(parse_duration_to_ms("1h").expect("parse"), 3_600_000);
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_multi_byte_unit_without_panicking() {
+        let err = parse_duration_to_ms("5\u{20ac}").expect_err("multi-byte unit should error");
+        assert!(err.to_string().contains("unknown duration unit"));
+
+        let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
+        assert!(err.to_string().contains("invalid duration"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_out_of_range_values_without_overflowing() {
+        let err = parse_duration_to_ms("9223372036854775807h").expect_err("overflow should error");
+        assert!(err.to_string().contains("duration out of range"));
+
+        let err = parse_duration_to_ms("-9223372036854775808h").expect_err("overflow should error");
+        assert!(err.to_string().contains("duration out of range"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_accepts_the_largest_representable_duration() {
+        let max_hours = i64::MAX / 3_600_000;
+        assert_eq!(
+            parse_duration_to_ms(&format!("{max_hours}h")).expect("parse"),
+            max_hours * 3_600_000
+        );
+    }
+
+    #[test]
+    fn platform_progress_events_update_borrowed_display_without_duplicate_steps() {
+        let event = PlatformEvent {
+            metadata: HashMap::from([
+                (
+                    PROGRESS_COMPLETE_STEP_KEY.to_string(),
+                    PROGRESS_STEP_REQUESTING_SANDBOX.to_string(),
+                ),
+                (
+                    PROGRESS_ACTIVE_STEP_KEY.to_string(),
+                    PROGRESS_STEP_STARTING_SANDBOX.to_string(),
+                ),
+            ]),
+            ..PlatformEvent::default()
+        };
+        let mut display = ProvisioningDisplay::new();
+
+        assert!(handle_platform_progress_event(
+            &event,
+            Some(&mut display),
+            Instant::now(),
+        ));
+        assert!(handle_platform_progress_event(
+            &event,
+            Some(&mut display),
+            Instant::now(),
+        ));
+
+        assert_eq!(
+            display.completed_steps,
+            vec![ProvisioningStep::RequestingSandbox]
+        );
+        assert_eq!(display.completed_bars.len(), 1);
+        assert_eq!(
+            display.active_label,
+            ProvisioningStep::StartingSandbox.active_label()
+        );
+        display.clear();
+    }
+
+    // helper for building input
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Stands in for the catalog a connected gateway would publish.
+    fn catalog() -> &'static [openshell_providers::ProviderTypeProfile] {
+        static CATALOG: std::sync::OnceLock<Vec<openshell_providers::ProviderTypeProfile>> =
+            std::sync::OnceLock::new();
+        CATALOG
+            .get_or_init(openshell_providers::example_profiles::load_all)
+            .as_slice()
+    }
+
+    #[test]
+    fn suffix_match_no_profile() {
+        let env = env(&[("FOO_TOKEN", "x")]);
+        let prof = credential_env_matches(&env, catalog());
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(&prof[0].0, "FOO_TOKEN");
+        assert!(prof[0].1.is_empty());
+    }
+
+    #[test]
+    fn exact_profile_match() {
+        let env = env(&[("GITHUB_TOKEN", "x")]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(prof[0].0, "GITHUB_TOKEN");
+
+        let sug = &prof[0].1;
+        assert_eq!(sug.len(), 2_usize);
+
+        assert_eq!(sug[0].provider_type, "copilot");
+        assert_eq!(sug[0].credential, "api_token");
+
+        assert_eq!(sug[1].provider_type, "github");
+        assert_eq!(sug[1].credential, "api_token");
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let env = env(&[("gh_token", "x")]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert_eq!(prof.len(), 1_usize);
+        assert_eq!(prof[0].0, "gh_token");
+
+        let sug = &prof[0].1;
+        assert_eq!(sug.len(), 2_usize);
+
+        assert_eq!(sug[0].provider_type, "copilot");
+        assert_eq!(sug[0].credential, "api_token");
+
+        assert_eq!(sug[1].provider_type, "github");
+        assert_eq!(sug[1].credential, "api_token");
+    }
+
+    #[test]
+    fn non_credential_skipped() {
+        let env = env(&[("PATH", "x"), ("HOME", "y")]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert!(prof.is_empty());
+    }
+
+    #[test]
+    fn no_value_leak() {
+        let env = env(&[("APP_SECRET", "secretVALUE42")]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert_eq!(prof.len(), 1_usize);
+
+        let dumped = format!("{prof:?}");
+        assert!(!dumped.contains("secretVALUE42"), "value leaked: {dumped}");
+    }
+
+    #[test]
+    fn deterministic_order() {
+        let env = env(&[
+            ("ZED_TOKEN", "a"),
+            ("ABC_SECRET", "b"),
+            ("MID_PASSWORD", "c"),
+        ]);
+
+        let prof = credential_env_matches(&env, catalog());
+        let keys: Vec<&str> = prof.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["ABC_SECRET", "MID_PASSWORD", "ZED_TOKEN"]);
+    }
+
+    #[test]
+    fn nonsecrets() {
+        let env = env(&[
+            ("TOKENIZERS_PARALLELISM", "x"),
+            ("PASSWORDLESS_LOGIN", "y"),
+            ("SECRETARY_EMAIL", "z"),
+        ]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert!(prof.is_empty());
+    }
+
+    #[test]
+    fn segment_matches() {
+        let env = env(&[
+            ("DB_TOKEN", "a"),
+            ("MY_ACCESS_KEY", "b"),
+            ("PRIMARY_KEY", "c"),
+        ]);
+
+        let prof = credential_env_matches(&env, catalog());
+        assert_eq!(prof.len(), 2_usize);
+
+        let keys = prof.iter().map(|(k, _)| k.as_str()).collect::<Vec<&str>>();
+        assert!(keys.contains(&"DB_TOKEN"));
+        assert!(keys.contains(&"MY_ACCESS_KEY"));
+        assert!(!keys.contains(&"PRIMARY_KEY"));
+    }
 }

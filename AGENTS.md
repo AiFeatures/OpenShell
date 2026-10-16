@@ -10,62 +10,69 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
-Agent skills live in `.agents/skills/`. Your harness can discover and load them natively — do not rely on this file for a full inventory. The detailed skills table is in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
+OpenShell has two skill collections:
 
-## Workflow Chains
+- `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
+- `.agents/skills/` contains internal contributor and maintainer workflows for developing OpenShell. Your repository-aware harness can discover and load them natively.
 
-These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
-
-- **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
-  - Triage assesses and classifies community-filed issues. Spike investigates unknowns. Build implements.
-- **Internal development:** `create-spike` → `build-from-issue`
-  - Spike explores feasibility, then build executes once `state:agent-ready` is applied by a human.
-- **Security:** `review-security-issue` → `fix-security-issue`
-  - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `topic:security` label; fix also requires `state:agent-ready`.
-- **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
-  - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
+Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
 ## Architecture Overview
 
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
+| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
-| `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
-| `crates/openshell-bootstrap/` | Cluster bootstrap | K3s cluster setup, image loading, mTLS PKI |
-| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
+| `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
+| `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
+| `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
+| `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
+| `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
+| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
+| `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
+| `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
+| `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
+| `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
+| `crates/openshell-driver-kubernetes-secrets/` | Kubernetes Secrets credential driver | In-process `CredentialDriver` backend for OpenShell-managed K8s Secret storage |
+| `crates/openshell-driver-vault/` | Vault credential driver | In-process `CredentialDriver` backend for Vault-compatible KV storage |
+| `crates/openshell-driver-db-credstore/` | Database credential driver | In-process `CredentialDriver` backend for gateway database credential storage |
+| `crates/openshell-driver-kubernetes/` | Kubernetes compute driver | In-process `ComputeDriver` backend for K8s sandbox pods |
+| `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
+| `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
+| `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
+| `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
+| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
+| `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
+| `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
+| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
+| `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
+| `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
+| `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
-| `.agents/skills/` | Agent skills | Workflow automation for development |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
-| `architecture/` | Architecture docs | Design decisions and component documentation |
+| `docs/` | Published docs | MDX pages, navigation, and content assets |
+| `fern/` | Docs site config | Fern site config, components, and theme assets |
+| `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
+| `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
+| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
 
-## Vouch System
+## Public API Conventions
 
-- First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
-- Org members and collaborators bypass the vouch gate automatically.
-- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
-- Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
-
-## Issue and PR Conventions
-
-- **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
-- **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
-- **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
-- **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
-- **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
-- Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
-
-## Plans
-
-- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
-- When asked to write a plan, write it there without asking for the location.
+Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
+the canonical source for entity-reference naming, workspace selectors, field
+design, and schema evolution.
 
 ## Sandbox Logging (OCSF)
 
@@ -80,7 +87,7 @@ Use an OCSF builder + `ocsf_emit!()` for events that represent **observable sand
 - SSH authentication (accepted, denied, nonce replay)
 - Process lifecycle (start, exit, timeout, signal failure)
 - Security findings (unsafe policy, unavailable controls, replay attacks)
-- Configuration changes (policy load/reload, TLS setup, inference routes, settings)
+- Configuration changes (policy load/reload, TLS setup, provider attachments, settings)
 - Application lifecycle (supervisor start, SSH server ready)
 
 ### When to use plain tracing
@@ -102,7 +109,7 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | SSH sessions | `SshActivityBuilder` | Authentication, channel operations |
 | Process start/stop | `ProcessActivityBuilder` | Entrypoint lifecycle, signal failures |
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
-| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
+| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, provider attachments, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
 
 ### Severity guidelines
@@ -139,7 +146,7 @@ ocsf_emit!(event);
 
 ### Key points
 
-- `crate::ocsf_ctx()` returns the process-wide `SandboxContext`. It is always available (falls back to defaults in tests).
+- `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
@@ -148,26 +155,53 @@ ocsf_emit!(event);
 
 ## Sandbox Infra Changes
 
-- If you change sandbox infrastructure, ensure `mise run sandbox` succeeds.
+- If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
+
+## Network Sockets
+
+- On latency-sensitive TCP streams, disable Nagle's algorithm so small
+  request/response frames don't stall on delayed ACKs. Use
+  `openshell_core::net::set_tcp_nodelay_best_effort` on an accepted or
+  already-connected stream, or `openshell_core::net::connect_tcp_nodelay_best_effort`
+  when dialing.
+- This applies to loopback/localhost TCP too — the delayed-ACK stall is a timer
+  behavior, not wire latency.
+- You should skip it for unix domain sockets (no Nagle). It's not critical for
+  test-only connections, though using it on any non-UDS TCP stream — tests
+  included — is fine and preferred.
+
+## Branch Names
+
+Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-names).
+
+## Pull Requests
+
+Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
 
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
+- Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
 
-## Pre-commit
+## Go SDK (`sdk/go/`)
 
-- Run `mise run pre-commit` before committing.
-- Install the git hook when working locally: `mise generate git-pre-commit --write --task=pre-commit`
+- The Go SDK lives in `sdk/go/` with module path `github.com/NVIDIA/OpenShell/sdk/go`.
+- Run `mise run go:ci` for the full SDK CI pipeline (lint, build, test, proto-check, docs-check).
+- Proto bindings are generated with `mise run go:proto:gen` from the `.proto` files in `proto/`.
+- Domain types in `sdk/go/openshell/v1/types/` must not import proto packages.
+- Converters in `sdk/go/openshell/v1/internal/converter/` deep-copy slices and maps at boundaries.
+- Tests use bufconn for in-process gRPC and testify for assertions.
 
-## Testing
+## TypeScript SDK (`sdk/typescript/`)
 
-- `mise run pre-commit` — Lint, format, license headers. Run before every commit.
-- `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running cluster. Run for infrastructure, sandbox, or policy changes.
-- `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
+- Run `mise run sdk:ts:ci` for codegen, proto lint, Biome lint, type checking, unit tests, coverage, and build validation.
+- Proto bindings are generated with `mise run sdk:ts:proto` from the files selected in `sdk/typescript/buf.gen.yaml`.
+- Generated files under `sdk/typescript/src/gen/` are build outputs and must not be committed.
+- Keep the curated API free of generated wire types; expose full generated messages and RPCs through `@nvidia/openshell-sdk/raw`.
+- The release workflow publishes the package to GitHub Packages. Branch checks exercise the publish path with `npm publish --dry-run`.
 
 ## Python
 
@@ -179,14 +213,25 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change cluster bootstrap infrastructure (e.g., `openshell-bootstrap` crate, `deploy/docker/Dockerfile.images`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+
+## Skill Maintenance
+
+When behavior, commands, or development workflows change, review the related agent skills in the same branch. Use the `sync-agent-infra` skill for the maintenance map and consistency checks.
 
 ## Documentation
 
-- When making changes, update the relevant documentation in the `architecture/` directory.
-- When changes affect user-facing behavior, also update the relevant pages under `docs/`.
-- Follow the style guide in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): active voice, no unnecessary bold, no em dash overuse, no filler introductions.
-- Use the `update-docs` skill to scan recent commits and draft doc updates.
+- Put crate-specific implementation details in the relevant crate `README.md` and design proposals in `rfc/`.
+- When changes affect user-facing behavior, make the smallest necessary changes to the relevant published docs pages under `docs/` and navigation in `docs/index.yml`. Explain exactly what users need to know; avoid repeating information across pages or exhaustively describing internals that do not affect users.
+- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
+- `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
+- Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
+
+## Terminology
+
+- Treat `snap` as a common noun. Lowercase it in ordinary prose, but capitalize it where normal English sentence or title casing requires. Preserve proper names such as Snap Store, Snapcraft, and snapd.
 
 ## Security
 
